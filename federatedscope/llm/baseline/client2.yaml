@@ -15,8 +15,10 @@ distribute:
   use: True
   server_host: '127.0.0.1'
   server_port: 50051
-  role: 'server'
-  data_idx: 0
+  client_host: '127.0.0.1'
+  client_port: 50053
+  role: 'client'
+  data_idx: 2
   grpc_max_send_message_length: 1048576000
   grpc_max_receive_message_length: 1048576000
 llm:
@@ -27,7 +29,7 @@ llm:
     use: True
     args: [ { 'adapter_package': 'peft', 'adapter_method': 'lora', 'r': 8, 'lora_alpha': 32, 'lora_dropout': 0.1 } ]
   deepspeed:
-    use: False
+    use: True
     ds_config: 'federatedscope/llm/baseline/deepspeed/ds_config.json'
 dataloader:
   batch_size: 4
