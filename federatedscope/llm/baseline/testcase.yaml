@@ -5,7 +5,7 @@ early_stop:
 federate:
   mode: standalone
   client_num: 1
-  total_round_num: 200
+  total_round_num: 100
   save_to: "gpt2.ckpt"
   share_local_model: False
   online_aggr: False
@@ -18,6 +18,12 @@ llm:
   tok_len: 1000
   chat:
     max_len: 1000
+  adapter:
+    use: True
+    args: [ { 'adapter_package': 'peft', 'adapter_method': 'lora', 'r': 8, 'lora_alpha': 32, 'lora_dropout': 0.1 } ]
+  deepspeed:
+    use: True
+    ds_config: 'federatedscope/llm/baseline/deepspeed/ds_config.json'
 dataloader:
   batch_size: 1
 model:
@@ -35,3 +41,4 @@ trainer:
 eval:
   freq: 10
   metrics: ['loss']
+  count_flops: False

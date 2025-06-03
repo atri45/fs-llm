@@ -3,8 +3,8 @@ early_stop:
   patience: 10
 federate:
   mode: distributed
-  client_num: 1
-  total_round_num: 200
+  client_num: 2
+  total_round_num: 50
   save_to: "gpt2_new.ckpt"
 data:
   root: data/
@@ -25,8 +25,14 @@ llm:
   tok_len: 1000
   chat:
     max_len: 1000
+  adapter:
+    use: True
+    args: [ { 'adapter_package': 'peft', 'adapter_method': 'lora', 'r': 8, 'lora_alpha': 32, 'lora_dropout': 0.1 } ]
+  deepspeed:
+    use: True
+    ds_config: 'federatedscope/llm/baseline/deepspeed/ds_config.json'
 dataloader:
-  batch_size: 8
+  batch_size: 4
 model:
   type: 'gpt2@huggingface_llm'
 train:
@@ -42,3 +48,4 @@ trainer:
 eval:
   freq: 50
   metrics: ['loss']
+  count_flops: False

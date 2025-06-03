@@ -58,7 +58,7 @@ conda create -n fs-llm python=3.9
 conda activate fs-llm
 
 # Install Pytorch>=1.13.0 (e.g., Pytorch==2.0.0)
-conda install pytorch==2.0.0 torchvision==0.15.0 torchaudio==2.0.0 pytorch-cuda=11.7 -c pytorch -c nvidia
+conda install pytorch==2.0.0 torchvision==0.15.0 torchaudio==2.2.0 pytorch-cuda=11.8 -c pytorch -c nvidia
 
 # Install FS-LLM with editable mode
 pip install -e .[llm]
