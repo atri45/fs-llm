@@ -31,6 +31,10 @@ llm:
   deepspeed:
     use: True
     ds_config: 'federatedscope/llm/baseline/deepspeed/ds_config.json'
+  offsite_tuning:
+    use: False
+    emu_l: 2
+    emu_r: 30
 dataloader:
   batch_size: 4
 model:

@@ -25,7 +25,7 @@ llm:
     use: True
     ds_config: 'federatedscope/llm/baseline/deepspeed/ds_config.json'
 dataloader:
-  batch_size: 1
+  batch_size: 4
 model:
   type: 'gpt2@huggingface_llm'
 train:

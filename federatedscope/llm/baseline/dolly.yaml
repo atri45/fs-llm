@@ -1,26 +1,20 @@
 use_gpu: True
+device: 0
 early_stop:
   patience: 10
 federate:
-  mode: distributed
-  client_num: 2
-  total_round_num: 50
-  save_to: "gpt2_new.ckpt"
+  mode: standalone
+  client_num: 1
+  total_round_num: 100
+  save_to: "gpt2_dolly.ckpt"
+  share_local_model: False
+  online_aggr: False
 data:
   root: data/
-  type: 'alpaca@llm'
+  type: 'dolly-15k@llm'
   splits: [0.98,0.01,0.01]
-  splitter: 'iid'
-distribute:
-  use: True
-  server_host: '127.0.0.1'
-  server_port: 50051
-  client_host: '127.0.0.1'
-  client_port: 50053
-  role: 'client'
-  data_idx: 2
-  grpc_max_send_message_length: 1048576000
-  grpc_max_receive_message_length: 1048576000
+  splitter: 'lda'
+  splitter_args: [{'alpha': 0.05}]
 llm:
   tok_len: 1000
   chat:
@@ -31,10 +25,6 @@ llm:
   deepspeed:
     use: True
     ds_config: 'federatedscope/llm/baseline/deepspeed/ds_config.json'
-  offsite_tuning:
-    use: False
-    emu_l: 2
-    emu_r: 30
 dataloader:
   batch_size: 4
 model:
@@ -44,12 +34,11 @@ train:
   batch_or_epoch: batch
   optimizer:
     lr: 0.001
-    weight_decay: 0.0
 criterion:
   type: CrossEntropyLoss
 trainer:
   type: llmtrainer
 eval:
-  freq: 50
+  freq: 10
   metrics: ['loss']
   count_flops: False
