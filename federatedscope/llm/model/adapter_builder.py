@@ -53,6 +53,56 @@ def enable_adapter(model, package, adapter, **kwargs):
             peft_config = PromptEncoderConfig(task_type=TaskType.CAUSAL_LM,
                                               **kwargs)
             model = get_peft_model(model, peft_config)
+        elif adapter == 'adalora':
+            from peft import AdaLoraConfig
+            peft_config = AdaLoraConfig(task_type=TaskType.CAUSAL_LM,
+                                              **kwargs)
+            model = get_peft_model(model, peft_config)
+        elif adapter == 'loha':
+            from peft import LoHaConfig
+            peft_config = LoHaConfig(task_type=TaskType.CAUSAL_LM,
+                                              **kwargs)
+            model = get_peft_model(model, peft_config)
+        elif adapter == 'lokr':
+            from peft import LoKrConfig
+            peft_config = LoKrConfig(task_type=TaskType.CAUSAL_LM,
+                                              **kwargs)
+            model = get_peft_model(model, peft_config)
+        elif adapter == 'xlora':
+            from peft import XLoraConfig
+            peft_config = XLoraConfig(task_type=TaskType.CAUSAL_LM,
+                                              **kwargs)
+            model = get_peft_model(model, peft_config)
+        elif adapter == 'vera':
+            from peft import VeraConfig
+            peft_config = VeraConfig(task_type=TaskType.CAUSAL_LM,
+                                              **kwargs)
+            model = get_peft_model(model, peft_config)
+        elif adapter == 'vblora':
+            from peft import VBLoRAConfig
+            peft_config = VBLoRAConfig(task_type=TaskType.CAUSAL_LM,
+                                              **kwargs)
+            model = get_peft_model(model, peft_config)
+        elif adapter == 'ft':
+            from peft import FourierFTConfig
+            peft_config = FourierFTConfig(task_type=TaskType.CAUSAL_LM,
+                                              **kwargs)
+            model = get_peft_model(model, peft_config)
+        elif adapter == 'oft':
+            from peft import OFTConfig
+            peft_config = OFTConfig(task_type=TaskType.CAUSAL_LM,
+                                              **kwargs)
+            model = get_peft_model(model, peft_config)
+        elif adapter == 'boft':
+            from peft import BOFTConfig
+            peft_config = BOFTConfig(task_type=TaskType.CAUSAL_LM,
+                                              **kwargs)
+            model = get_peft_model(model, peft_config)
+        elif adapter == 'ia3':
+            from peft import IA3Config
+            peft_config = IA3Config(task_type=TaskType.CAUSAL_LM,
+                                              **kwargs)
+            model = get_peft_model(model, peft_config)
         else:
             raise NotImplementedError
         model.print_trainable_parameters()
@@ -71,47 +121,109 @@ def enable_adapter(model, package, adapter, **kwargs):
         """
         # TODO:  After supporting adapterhub, we will move the following
         #   parameters in yaml file for users' convenient
+        import adapters
+        adapters.init(model)
+
         if adapter == 'lora':
-            from transformers.adapters import LoRAConfig
+            from adapters import LoRAConfig
 
-            config = LoRAConfig(r=8, alpha=16)
-            model.add_adapter("lora_adapter", config=config)
-            model.train_adapter(['lora_adapter'])
+            config = LoRAConfig(r=8, alpha=32)
+            model.add_adapter("lora", config=config)
+            model.train_adapter(['lora'])
+
         elif adapter == 'bottleneck':
-            from transformers.adapters import AdapterConfig
+            from adapters import BnConfig
 
-            config = AdapterConfig(mh_adapter=True,
+            config = BnConfig(mh_adapter=True,
                                    output_adapter=True,
                                    reduction_factor=16,
                                    non_linearity="relu")
+
+            # from adapters import AdapterPlusConfig
+            # config = AdapterPlusConfig()
             model.add_adapter("bottleneck_adapter", config=config)
             model.train_adapter(['bottleneck_adapter'])
-        elif adapter == 'lang':
-            from transformers.adapters import PfeifferInvConfig
 
-            config = PfeifferInvConfig()
-            model.add_adapter("lang_adapter", config=config)
-            model.train_adapter(['lang_adapter'])
+        elif adapter == 'language':
+            from adapters import DoubleSeqBnInvConfig
+
+            config = DoubleSeqBnInvConfig()
+            model.add_adapter("language_adapter", config=config)
+            model.train_adapter(['language_adapter'])
+
         elif adapter == 'prefix':
-            from transformers.adapters import PrefixTuningConfig
+            from adapters import PrefixTuningConfig
 
             config = PrefixTuningConfig(flat=False, prefix_length=30)
             model.add_adapter("prefix_tuning", config=config)
             model.train_adapter(['prefix_tuning'])
+
         elif adapter == 'compacter':
-            from transformers.adapters import CompacterConfig
+            from adapters import CompacterConfig
 
             config = CompacterConfig()
-            model.add_adapter("dummy", config=config)
-            model.train_adapter(['dummy'])
-        elif adapter == 'ia_3':
-            from transformers.adapters import IA3Config
+            model.add_adapter("compacter", config=config)
+            model.train_adapter(['compacter'])
+
+        elif adapter == 'ia3':
+            from adapters import IA3Config
 
             config = IA3Config()
-            model.add_adapter("ia3_adapter", config=config)
-            model.train_adapter(['ia3_adapter'])
+            model.add_adapter("ia3", config=config)
+            model.train_adapter(['ia3'])
+
+        # exist bug
+        elif adapter == 'vera':
+            from adapters import VeraConfig
+
+            config = VeraConfig()
+            model.add_adapter("vera_config", config=config)
+            model.train_adapter(['vera_config'])
+
+        elif adapter == 'prompt':
+            from adapters import PromptTuningConfig
+
+            config = PromptTuningConfig(prompt_length=10)
+            model.add_adapter("prompt_tuning", config=config)
+            model.train_adapter(['prompt_tuning'])
+
+        elif adapter == 'loreft':
+            from adapters import LoReftConfig
+
+            config = LoReftConfig()
+            model.add_adapter("loreft", config=config)
+            model.train_adapter(['loreft'])
+
+        elif adapter == 'noreft':
+            from adapters import NoReftConfig
+
+            config = NoReftConfig()
+            model.add_adapter("noreft", config=config)
+            model.train_adapter(['noreft'])
+
+        elif adapter == 'direft':
+            from adapters import DiReftConfig
+
+            config = DiReftConfig()
+            model.add_adapter("direft", config=config)
+            model.train_adapter(['direft'])
+
+        elif adapter == 'mam':
+            from adapters import MAMConfig
+
+            config = MAMConfig()
+            model.add_adapter("mam_adapter", config=config)
+            model.train_adapter(['mam_adapter'])
+
+        elif adapter == 'unipelt':
+            from adapters import UniPELTConfig
+
+            config = UniPELTConfig()
+            model.add_adapter("unipelt", config=config)
+            model.train_adapter(['unipelt'])
+
         elif adapter == 'union':
-            from transformers.adapters import AdapterConfig, ConfigUnion
+            from adapters import AdapterConfig, ConfigUnion
 
             # TODO: configure these args in cfg
             config = ConfigUnion(
@@ -126,16 +238,8 @@ def enable_adapter(model, package, adapter, **kwargs):
             )
             model.add_adapter("union_adapter", config=config)
             model.train_adapter(['union_adapter'])
-        elif adapter == 'mam':
-            from transformers.adapters import \
-                ConfigUnion, ParallelConfig, PrefixTuningConfig
 
-            config = ConfigUnion(
-                PrefixTuningConfig(bottleneck_size=800),
-                ParallelConfig(),
-            )
-            model.add_adapter("mam_adapter", config=config)
-            model.train_adapter(['mam_adapter'])
+
         else:
             raise NameError(
                 f"There is no adapter named {adapter} in {package}")

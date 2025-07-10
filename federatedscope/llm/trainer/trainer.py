@@ -64,7 +64,8 @@ class LLMTrainer(GeneralTorchTrainer):
         input_ids = ctx.data_batch['input_ids'].to(ctx.device)
         labels = ctx.data_batch['labels'].to(ctx.device)
         attention_mask = ctx.data_batch['attention_mask'].to(ctx.device)
-
+        attention_mask = attention_mask.long()
+        
         if ctx.cfg.llm.deepspeed.use:
             outputs = ctx.model_engine(input_ids=input_ids,
                                        labels=labels,

@@ -1,5 +1,7 @@
 # project specific
 doc/build
+data
+exp
 
 # ml log
 wandb/
