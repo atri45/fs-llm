@@ -14,6 +14,7 @@ from federatedscope.core.monitors.monitor import Monitor
 from federatedscope.core.auxiliaries.optimizer_builder import get_optimizer
 from federatedscope.core.auxiliaries.scheduler_builder import get_scheduler
 from federatedscope.llm.model.adapter_builder import AdapterModel
+from torch.nn.utils.convert_parameters import parameters_to_vector
 
 logger = logging.getLogger(__name__)
 
@@ -61,11 +62,21 @@ class LLMTrainer(GeneralTorchTrainer):
         ctx.ys_prob = CtxVar([], LIFECYCLE.ROUTINE)
 
     def _hook_on_batch_forward(self, ctx):
+
+        # logger.info(f"--- [FL Client #{ctx.cfg.distribute.data_idx}] "
+        #             f"Params BEFORE FORWARD at Round ---")
+        # with torch.no_grad():
+        #     for name, param in ctx.model.named_parameters():
+        #         if param.requires_grad:
+        #             norm = torch.linalg.norm(param.data.float()).item()
+        #             logger.info(f"  - Norm of '{name}': {norm:.8f}")
+        # # --- 打印逻辑结束 ---
+
         input_ids = ctx.data_batch['input_ids'].to(ctx.device)
         labels = ctx.data_batch['labels'].to(ctx.device)
         attention_mask = ctx.data_batch['attention_mask'].to(ctx.device)
         attention_mask = attention_mask.long()
-        
+        log_memory_usage("Forward Start")
         if ctx.cfg.llm.deepspeed.use:
             outputs = ctx.model_engine(input_ids=input_ids,
                                        labels=labels,
@@ -74,7 +85,7 @@ class LLMTrainer(GeneralTorchTrainer):
             outputs = ctx.model(input_ids=input_ids,
                                 labels=labels,
                                 attention_mask=attention_mask)
-
+        log_memory_usage("Forward End")
         logits = outputs.logits
         loss = outputs.loss
 
@@ -97,17 +108,84 @@ class LLMTrainer(GeneralTorchTrainer):
             return
 
         if ctx.cfg.llm.deepspeed.use:
+            log_memory_usage("Backward Start")
             ctx.model_engine.backward(ctx.loss_task)
+            log_memory_usage("Backward End (Grads Collected)")
+            log_memory_usage("Step Start")
             ctx.model_engine.step()
+            log_memory_usage("Step End")
         else:
             ctx.optimizer.zero_grad()
+            log_memory_usage("Backward Start")
+            real_lr = 0.001
             ctx.loss_task.backward()
 
+            # # --- 在这里打印梯度 ---
+            # logger.info(f"--- [FL Trainer] Gradients at Round #---")
+            # total_grad_norm = 0.0
+            # # 我们只打印可训练的 (LoRA) 参数的梯度
+            # for name, param in ctx.model.named_parameters():
+            #     if param.requires_grad and param.grad is not None:
+            #         grad_norm = torch.linalg.norm(param.grad.detach().float()).item()
+            #         total_grad_norm += grad_norm ** 2
+            #         # 打印每个 LoRA 参数梯度的 L2 范数，这是一个很好的摘要信息
+            #         logger.info(f"  - Grad norm of '{name}': {grad_norm:.6f}")
+            # total_grad_norm = total_grad_norm ** 0.5
+            # logger.info(f"  - TOTAL GRAD NORM (L2): {total_grad_norm:.6f}")
+            # # --- 打印逻辑结束 ---
+
+            # with torch.no_grad():
+            #     for param in ctx.model.parameters():
+            #         if param.grad is not None:
+            #             param.grad.mul_(real_lr)
+            log_memory_usage("Backward End (Grads Collected)")
             if ctx.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(ctx.model.parameters(),
                                                ctx.grad_clip)
-
+            log_memory_usage("Step Start")
             ctx.optimizer.step()
+
+            # # --- 打印【本地更新后】的参数范数 ---
+            # total_norm_sq = 0.0
+            # with torch.no_grad():
+            #     # 我们只打印可训练的 (LoRA) 参数
+            #     for name, param in ctx.model.named_parameters():
+            #         if param.requires_grad:
+            #             norm = torch.linalg.norm(param.data.float()).item()
+            #             total_norm_sq += norm ** 2
+            #             logger.info(f"  - Norm of '{name}': {norm:.8f}")
+            # logger.info(f"  - TOTAL PARAMS NORM: {total_norm_sq:.8f}")
+            # --- 打印逻辑结束 ---
+        #     # --- 在 step() 之后打印优化器状态 ---
+        #     logger.info(f"--- [FL Trainer] Optimizer State after Step at Round ---")
+        #     total_state_mem = 0
+            
+        #     # 检查 state 是否为空
+        #     if not ctx.optimizer.state:
+        #         logger.info("  - Optimizer state is empty.")
+            
+        #     # 遍历优化器状态字典
+        #     for param, state in ctx.optimizer.state.items():
+        #         # 找到这个参数的名称，以便更好地识别
+        #         param_name = "Unknown"
+        #         for name, p in ctx.model.named_parameters():
+        #             if id(p) == id(param):
+        #                 param_name = name
+        #                 break
+
+        #         logger.info(f"  - State for param '{param_name}':")
+        #         for key, value in state.items():
+        #             if isinstance(value, torch.Tensor):
+        #                 mem_bytes = value.numel() * value.element_size()
+        #                 total_state_mem += mem_bytes
+        #                 norm = torch.linalg.norm(value.float()).item()
+        #                 logger.info(f"    - '{key}': shape={list(value.shape)}, norm={norm:.6f}, mem={mem_bytes/1024:.2f} KB")
+        #             else:
+        #                 logger.info(f"    - '{key}': {value}")
+            
+        #     logger.info(f"  - TOTAL OPTIMIZER STATE MEMORY: {total_state_mem / (1024**2):.4f} MB")
+        # # --- 打印逻辑结束 ---
+            log_memory_usage("Step End")
         if ctx.scheduler is not None:
             ctx.scheduler.step()
 
@@ -214,7 +292,19 @@ class LLMTrainer(GeneralTorchTrainer):
         # thus simply multiply the flops to avoid redundant forward
         ctx.monitor.total_flops += ctx.monitor.flops_per_sample * \
             ctx.batch_size
-
+            
+def log_memory_usage(stage_name):
+    """打印当前 rank 的 GPU 内存使用情况。"""
+    # if torch.cuda.is_available():
+    #     allocated = torch.cuda.memory_allocated("cuda:0") / (1024 ** 2)  # MB
+    #     reserved = torch.cuda.memory_reserved("cuda:0") / (1024 ** 2)    # MB
+    #     max_allocated = torch.cuda.max_memory_allocated("cuda:0") / (1024 ** 2) # MB
+    #     logger.info(
+    #         f"[MemMon][{stage_name}] "
+    #         f"Allocated: {allocated:.2f} MB | "
+    #         f"Reserved: {reserved:.2f} MB | "
+    #         f"Peak Allocated: {max_allocated:.2f} MB"
+    #     )
 
 def call_llm_trainer(trainer_type):
     if trainer_type == 'llmtrainer':

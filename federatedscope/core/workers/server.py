@@ -2,6 +2,7 @@ import logging
 import copy
 import os
 import sys
+import torch
 
 import numpy as np
 import pickle
@@ -17,6 +18,7 @@ from federatedscope.core.auxiliaries.utils import merge_dict_of_results, \
 from federatedscope.core.auxiliaries.trainer_builder import get_trainer
 from federatedscope.core.secret_sharing import AdditiveSecretSharing
 from federatedscope.core.workers.base_server import BaseServer
+from torch.nn.utils.convert_parameters import parameters_to_vector
 
 logger = logging.getLogger(__name__)
 if get_ds_rank() == 0:
@@ -484,6 +486,18 @@ class Server(BaseServer):
             result = aggregator.aggregate(agg_info)
             # Due to lazy load, we merge two state dict
             merged_param = merge_param_dict(model.state_dict().copy(), result)
+            # # --- 打印【聚合后】的参数范数 ---
+            # with torch.no_grad():
+            #     # 临时加载聚合结果以计算范数
+            #     temp_model = copy.deepcopy(model)
+            #     temp_model.load_state_dict(merged_param, strict=False)
+            #     aggregated_params_vec = parameters_to_vector(
+            #         [p for p in temp_model.parameters() if p.requires_grad]
+            #     )
+            #     norm = torch.linalg.norm(aggregated_params_vec.float()).item()
+            #     logger.info(f"--- [FL Server] "
+            #                 f"Params Norm AFTER AGGREGATION: {norm:.8f} ---")
+            # # --- 打印逻辑结束 --
             model.load_state_dict(merged_param, strict=False)
 
         return aggregated_num

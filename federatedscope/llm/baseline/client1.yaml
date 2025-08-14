@@ -1,6 +1,6 @@
 use_gpu: True
 early_stop:
-  patience: 10
+  patience: 0
 federate:
   mode: distributed
   client_num: 2
@@ -29,27 +29,30 @@ llm:
     use: True
     args: [ { 'adapter_package': 'peft', 'adapter_method': 'lora', 'r': 8, 'lora_alpha': 32, 'lora_dropout': 0.1 } ]
   deepspeed:
-    use: True
+    use: False
     ds_config: 'federatedscope/llm/baseline/deepspeed/ds_config.json'
   offsite_tuning:
     use: False
     emu_l: 2
     emu_r: 30
 dataloader:
-  batch_size: 4
+  batch_size: 2
 model:
   type: 'gpt2@huggingface_llm'
 train:
   local_update_steps: 10
   batch_or_epoch: batch
   optimizer:
-    lr: 0.001
+    type: AdamW
+    lr: 0.0003
     weight_decay: 0.0
+    betas: [0.9, 0.999]
+    eps: 1e-8
 criterion:
   type: CrossEntropyLoss
 trainer:
   type: llmtrainer
 eval:
-  freq: 50
+  freq: 1000
   metrics: ['loss']
   count_flops: False

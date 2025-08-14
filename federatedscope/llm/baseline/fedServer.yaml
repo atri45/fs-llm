@@ -2,10 +2,13 @@ use_gpu: True
 early_stop:
   patience: 0
 federate:
+  method: fedspeed
+  aggregation_mode: 'model'
+  aggregation_steps: 10
   mode: distributed
   client_num: 2
-  total_round_num: 50
-  save_to: "gpt2_new.ckpt"
+  total_round_num: 1
+  save_to: "gpt2_alpaca.ckpt"
 data:
   root: data/
   type: 'alpaca@llm'
@@ -16,7 +19,7 @@ distribute:
   server_host: '127.0.0.1'
   server_port: 50051
   role: 'server'
-  data_idx: 0
+  data_idx: -1
   grpc_max_send_message_length: 1048576000
   grpc_max_receive_message_length: 1048576000
 llm:
@@ -25,7 +28,7 @@ llm:
     max_len: 1000
   adapter:
     use: True
-    args: [ { 'adapter_package': 'peft', 'adapter_method': 'lora', 'r': 8, 'lora_alpha': 32, 'lora_dropout': 0.1 } ]
+    args: [ { 'adapter_package': 'peft', 'adapter_method': 'lora', 'r': 8, 'lora_alpha': 32, 'lora_dropout': 0.1, 'target_modules': ['c_attn'] } ]
   deepspeed:
     use: False
     ds_config: 'federatedscope/llm/baseline/deepspeed/ds_config.json'
@@ -38,19 +41,16 @@ dataloader:
 model:
   type: 'gpt2@huggingface_llm'
 train:
-  local_update_steps: 10
+  local_update_steps: 500
   batch_or_epoch: batch
   optimizer:
-    type: AdamW
-    lr: 0.0003
+    lr: 0.001
     weight_decay: 0.0
-    betas: [0.9, 0.999]
-    eps: 1e-8
 criterion:
   type: CrossEntropyLoss
 trainer:
-  type: llmtrainer
+  type: fedspeedtrainer
 eval:
-  freq: 1000
+  freq: 10
   metrics: ['loss']
   count_flops: False

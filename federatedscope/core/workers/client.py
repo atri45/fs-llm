@@ -1,3 +1,78 @@
+import time
+import torch
+import psutil
+import os
+import logging
+
+logger = logging.getLogger(__name__)
+
+class PerformanceMonitor:
+    def __init__(self, device):
+        self.device = device
+        self.start_time = 0.0
+        self.end_time = 0.0
+        
+        # 追踪 CPU 内存 (RAM)
+        self.process = psutil.Process(os.getpid())
+        self.cpu_mem_usage_peak = 0.0 # 单位: MB
+
+        # 追踪 GPU 显存 (VRAM)
+        self.gpu_mem_allocated_peak = 0.0 # 单位: MB
+        self.gpu_mem_reserved_peak = 0.0  # 单位: MB
+
+    def _is_cuda(self):
+        """一个辅助函数，用于判断是否在使用 CUDA。"""
+        if not torch.cuda.is_available():
+            return False
+        if isinstance(self.device, torch.device):
+            return self.device.type == 'cuda'
+        elif isinstance(self.device, str):
+            return 'cuda' in self.device
+        elif isinstance(self.device, int):
+            return self.device >= 0 # 假设非负整数代表 GPU ID
+        return False
+
+    def start(self):
+        """开始计时和监控。"""
+        # 使用辅助函数进行判断
+        if self._is_cuda():
+            torch.cuda.reset_peak_memory_stats(self.device)
+        
+        self.start_time = time.time()
+        logger.info("Performance monitor started.")
+        
+    def stop(self):
+        """停止计时，收集峰值数据，并打印报告。"""
+        self.end_time = time.time()
+        
+        # 收集峰值数据
+        self.cpu_mem_usage_peak = self.process.memory_info().rss / (1024 ** 2)
+        
+        if self._is_cuda():
+            stats = torch.cuda.memory_stats(self.device)
+            self.gpu_mem_allocated_peak = stats["allocated_bytes.all.peak"] / (1024 ** 2)
+            self.gpu_mem_reserved_peak = stats["reserved_bytes.all.peak"] / (1024 ** 2)
+
+        self.report()
+
+    def report(self):
+        """打印性能报告。"""
+        total_seconds = self.end_time - self.start_time
+        total_minutes = total_seconds / 60.0
+
+        logger.info("----------- Performance Report -----------")
+        logger.info(f"  - Total Training Time: {total_minutes:.2f} minutes ({total_seconds:.2f} seconds)")
+        logger.info(f"  - CPU Memory Peak Usage (RSS): {self.cpu_mem_usage_peak:.2f} MB")
+        
+        if self._is_cuda():
+            logger.info(f"  - GPU Memory Peak Allocated: {self.gpu_mem_allocated_peak:.2f} MB")
+            logger.info(f"  - GPU Memory Peak Reserved: {self.gpu_mem_reserved_peak:.2f} MB")
+        else:
+            logger.info("  - GPU Monitoring: Not available (CUDA not found or not used).")
+        logger.info("------------------------------------------")
+
+
+
 import copy
 import logging
 import sys
@@ -111,6 +186,7 @@ class Client(BaseClient):
                                    is_attacker=self.is_attacker,
                                    monitor=self._monitor)
         self.device = device
+        self.monitor = PerformanceMonitor(self.device)
 
         # For client-side evaluation
         self.best_results = dict()
@@ -256,6 +332,8 @@ class Client(BaseClient):
         Arguments:
             message: The received message
         """
+        self.monitor.start()
+        
         if 'ss' in message.msg_type:
             # A fragment of the shared secret
             state, content, timestamp = message.state, message.content, \
@@ -594,6 +672,7 @@ class Client(BaseClient):
                                 strict=self._cfg.federate.share_local_model)
 
         self._monitor.finish_fl()
+        self.monitor.stop()
 
     def callback_funcs_for_converged(self, message: Message):
         """

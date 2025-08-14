@@ -1,0 +1,835 @@
+import torch
+import torch.distributed as dist
+import logging
+import copy
+import re
+
+from torch.nn.utils.convert_parameters import parameters_to_vector, vector_to_parameters
+from federatedscope.core.auxiliaries.optimizer_builder import get_optimizer
+from collections import OrderedDict
+from torch.nn.utils import clip_grad_norm_
+
+logger = logging.getLogger(__name__)
+
+
+class FedSpeedEngine:
+    """
+    【重构后】客户端引擎。
+    它接收服务器预处理好的参数分片和引用计数，专注于执行训练循环。
+    """
+    def __init__(self, model, config, device, process_group, initial_shards, ref_counts):
+        self.model = model
+        self.cfg = config
+        self.device = device
+        self.comm_group = process_group or dist.group.WORLD
+        self.rank = dist.get_rank(group=self.comm_group)
+        self.world_size = dist.get_world_size(group=self.comm_group)
+        self.current_step = 0
+
+        # 状态
+        self.aggregation_mode = config.federate.get('aggregation_mode', 'gradient') # 默认为梯度聚合
+        # for 'gradient' mode
+        self.fp32_master_param_shard = None
+        self.sharded_optimizer = None
+        # for 'model' mode
+        self.local_optimizer = None
+        self.local_trainable_model = None
+        self._my_shard_info = {} # 用于切片
+        self.temp_full_gradients = {}
+        self.use_checkpointing = False
+        self.is_recomputing = False
+        self.is_first_step = True
+        self.gradients_mem = 0
+        self.grad_clip_norm = 1.0
+        
+        # 引用计数 (从服务器接收)
+        self.param_id_to_fwd_ref_count = ref_counts['fwd']
+        self.param_id_to_recompute_ref_count = ref_counts['recompute']
+        self.param_id_to_bwd_ref_count = ref_counts['bwd']
+        self.param_fwd_ref_count = {}
+        self.param_recompute_ref_count = {}
+        self.param_bwd_ref_count = {}
+
+        # 映射关系
+        self.module_to_params_map = {}
+        self.id_to_param_map = {}
+        self.name_to_param_map = {}
+        self.trainable_param_names = set()
+
+        # --- 初始化引擎核心状态 ---
+        self._load_shards_and_build_maps(initial_shards, ref_counts['id_to_param_map_keys'])
+        self.ordered_trainable_names = sorted(
+            list(self.trainable_param_names),
+            key=natural_sort_key
+        )
+        self._build_module_param_map()
+        self._initialize_optimizer()
+    
+     # --- 初始化函数 ---
+
+    def _load_shards_and_build_maps(self, initial_shards, id_to_param_map_keys):
+        """用服务器发来的数据初始化参数状态和映射。"""
+        # 建立 name -> param 映射
+        temp_name_to_param = {name: p for name, p in self.model.named_parameters()}
+
+        with torch.no_grad():
+            for name, shard_info in initial_shards.items():
+                param = temp_name_to_param[name]
+                param.fedspeed_original_shape = shard_info['original_shape']
+                param.fedspeed_status = "SHARDED"
+                param.fedspeed_shard = torch.nn.Parameter(
+                    shard_info['shard_data'].to(self.device), 
+                    requires_grad=False
+                )
+                param.data = torch.empty(0, dtype=param.fedspeed_shard.dtype, device=self.device)
+                
+                if shard_info['is_trainable']:
+                    self.trainable_param_names.add(name)
+                self.name_to_param_map[name] = param
+
+        # 服务端和客户端的模型结构和参数ID必须一致
+        # 我们用服务端发来的ID列表来重建id_to_param_map
+        all_params = list(self.model.parameters())
+        if len(id_to_param_map_keys) != len(all_params):
+             raise ValueError("Mismatch in parameter count between server and client model.")
+        for i, param_id in enumerate(id_to_param_map_keys):
+             self.id_to_param_map[param_id] = all_params[i]
+
+    def _build_module_param_map(self):
+        """在客户端侧重建模块到参数ID的映射。"""
+        for module in self.model.modules():
+            # 为每个模块分配一个唯一的ID
+            if not hasattr(module, 'fedspeed_id'):
+                module.fedspeed_id = id(module)
+            params_in_module = [id(p) for p in module._parameters.values() if p is not None]
+            self.module_to_params_map[module.fedspeed_id] = params_in_module
+
+    def _initialize_optimizer(self):
+        """
+        【重构】根据 aggregation_mode 初始化相应的优化器和参数缓冲区。
+        """        
+        # --- 根据模式进行不同的初始化 ---
+        if self.aggregation_mode == 'gradient':
+            self._initialize_for_gradient_aggregation()
+        elif self.aggregation_mode == 'model':
+            self._initialize_for_model_aggregation()
+        else:
+            raise ValueError(f"Unknown aggregation mode: {self.aggregation_mode}")
+
+    def _initialize_for_gradient_aggregation(self):
+        """为 'gradient' 模式初始化分片优化器。"""
+        logger.info("Initializing for 'gradient' aggregation mode with sharded optimizer.")
+        trainable_shards = [self.name_to_param_map[name].fedspeed_shard for name in self.ordered_trainable_names]
+        if not trainable_shards: return
+
+        self.fp32_master_param_shard = parameters_to_vector(trainable_shards).clone().float().detach()
+        self.fp32_master_param_shard.requires_grad = True
+        
+        # (复用我们之前写好的动态优化器创建逻辑)
+        optimizer_config = self.cfg.train.optimizer
+        optimizer_kwargs = copy.deepcopy(optimizer_config)
+        optimizer_type = optimizer_kwargs.pop('type')
+        lr = optimizer_kwargs.pop('lr')
+        if '__help_info__' in optimizer_kwargs:
+            del optimizer_kwargs['__help_info__']
+        if '__cfg_check_funcs__' in optimizer_kwargs:
+            del optimizer_kwargs['__cfg_check_funcs__']
+        if 'is_ready_for_run' in optimizer_kwargs:
+            del optimizer_kwargs['is_ready_for_run']
+        if hasattr(torch.optim, optimizer_type):
+            optimizer_class = getattr(torch.optim, optimizer_type)
+        else:
+            raise NotImplementedError(
+                f"Optimizer '{optimizer_type}' is not implemented in torch.optim."
+            )
+        
+        self.sharded_optimizer = optimizer_class([self.fp32_master_param_shard], lr=lr, **optimizer_kwargs)
+
+    def _initialize_for_model_aggregation(self):
+        """为 'model' 模式初始化完整优化器。"""
+        logger.info("Initializing for 'model' aggregation mode with full local optimizer.")
+        
+        self.local_trainable_model = torch.nn.Module()
+        params_dict = OrderedDict()
+        for name in self.ordered_trainable_names: # 使用类属性
+            param = self.name_to_param_map[name]
+            # 创建一个与完整参数形状相同的 Parameter 对象
+            params_dict[name] = torch.nn.Parameter(
+                torch.empty(param.fedspeed_original_shape, device=self.device)
+            )
+        self.local_trainable_model._parameters = params_dict
+        self.local_optimizer = get_optimizer(self.local_trainable_model, **self.cfg.train.optimizer)
+
+        # (计算分片信息时也需要使用正确的顺序)
+        my_shard_numel = 0
+        local_shards = [self.name_to_param_map[name].fedspeed_shard for name in self.ordered_trainable_names]
+        if local_shards:
+            my_shard_numel = parameters_to_vector(local_shards).numel()
+
+        all_shard_numels_t = [torch.tensor(0, dtype=torch.long, device=self.device) for _ in range(self.world_size)]
+        dist.all_gather(all_shard_numels_t, torch.tensor(my_shard_numel, dtype=torch.long, device=self.device))
+        split_sizes = [t.item() for t in all_shard_numels_t]
+        my_offset = sum(split_sizes[:self.rank])
+        self._my_shard_info = {'offset': my_offset, 'size': my_shard_numel}
+
+    def _register_hooks_recursively(self, module: torch.nn.Module, prefix=''):
+        """递归注册钩子。"""
+        module.register_forward_pre_hook(self._pre_forward_hook_fn)
+        module.register_forward_hook(self._post_forward_hook_fn)
+        module.register_full_backward_pre_hook(self._pre_backward_hook_fn)
+        module.register_full_backward_hook(self._post_backward_hook_fn)
+        for name, param in module.named_parameters(recurse=False):
+            if param.requires_grad:
+                fullname = prefix + name
+                param.register_hook(self._collect_grad_hook_factory(fullname))
+        for name, child in module.named_children():
+            self._register_hooks_recursively(child, prefix=prefix + name + '.')
+
+    # --- 核心钩子函数 ---
+
+    def _pre_forward_hook_fn(self, module, inputs):
+        """在前向传播进入一个子模块之前，重建该模块所需的所有参数。"""
+        logger.debug(f"[PRE-FWD HOOK @ Rank {self.rank}] For {type(module).__name__}")
+
+        params_to_gather = []
+        for param in module._parameters.values():
+            if param is not None and hasattr(param, 'fedspeed_status') and param.fedspeed_status == "SHARDED":
+                params_to_gather.append(param)
+        if not params_to_gather:
+            return
+        with torch.no_grad():
+            for param in params_to_gather:
+                # 如果这个参数在所有 rank 上都是空的，则跳过
+                if param.fedspeed_original_shape[0] == 0:
+                    continue
+                
+                # 如果参数太小，只在 rank 0 上，那么需要广播
+                if param.fedspeed_original_shape[0] < self.world_size:
+                    full_param_tensor = torch.empty(param.fedspeed_original_shape, 
+                                                    dtype=param.fedspeed_shard.dtype, 
+                                                    device=self.device)
+                    # rank 0 持有数据，将其广播给其他人
+                    src_rank = 0
+                    dist.broadcast(full_param_tensor, src=src_rank, group=self.comm_group)
+                    param.data = full_param_tensor
+                    param.fedspeed_status = "FULL"
+                    continue
+                    
+                # 将本地分片扁平化
+                local_shard_flat = param.fedspeed_shard.data.flatten()
+                
+                # 1. 【第一步：尺寸同步】
+                # 获取本地扁平化分片的元素数量
+                my_numel = local_shard_flat.numel()
+                # 准备一个 tensor 来接收所有 rank 的 numel
+                all_numels = [torch.tensor(0, dtype=torch.long, device=self.device) for _ in range(self.world_size)]
+                # 使用 all_gather 收集所有人的 numel
+                dist.all_gather(all_numels, torch.tensor(my_numel, dtype=torch.long, device=self.device))
+                all_numels_list = [t.item() for t in all_numels]
+
+                # 2. 【第二步：数据收集】
+                # 2a. 计算所有分片的最大尺寸
+                max_numel = max(all_numels_list)
+
+                # 2b. 填充本地分片到最大尺寸
+                padded_local_shard = torch.zeros(max_numel, dtype=local_shard_flat.dtype, device=self.device)
+                padded_local_shard[:my_numel] = local_shard_flat
+                
+                # 2c. 准备输出张量，它将包含所有填充后的分片
+                # 每个 rank 都会得到一个一模一样的、包含所有数据的张量
+                all_padded_shards_flat = torch.empty(max_numel * self.world_size, dtype=local_shard_flat.dtype, device=self.device)
+
+                # 2d. 执行 all_gather
+                # 输入张量 (padded_local_shard) 在所有 rank 上形状相同 (max_numel,)
+                # 输出张量 (all_padded_shards_flat) 也在所有 rank 上形状相同
+                dist.all_gather_into_tensor(all_padded_shards_flat, padded_local_shard)
+                
+                # 3. 【第三步：手动切片和重组】
+                # 从巨大的扁平张量中，根据真实的尺寸信息 (all_numels_list)，切出每个 rank 的有效数据，并拼接起来。
+                tensors_to_cat = []
+                current_offset = 0
+                for i in range(self.world_size):
+                    # rank i 的真实数据长度
+                    real_numel = all_numels_list[i]
+                    # 从填充后的大张量中，切出 rank i 的填充后分片
+                    padded_shard_i = all_padded_shards_flat.narrow(0, i * max_numel, max_numel)
+                    # 从中只取有效部分
+                    real_shard_i = padded_shard_i.narrow(0, 0, real_numel)
+                    tensors_to_cat.append(real_shard_i)
+                
+                # 拼接成完整的、扁平化的参数
+                full_param_flat = torch.cat(tensors_to_cat, dim=0)
+
+                # 恢复原始形状
+                param.data = full_param_flat.view(param.fedspeed_original_shape)
+                param.fedspeed_status = "FULL"
+
+    def _post_forward_hook_fn(self, module, inputs, outputs):
+        """在前向传播离开一个子模块之后，立即丢弃不再使用的参数。"""
+        logger.debug(f"[POST-FWD HOOK @ Rank {self.rank}] For {type(module).__name__}")
+
+        param_ids_in_module = self.module_to_params_map.get(id(module), [])
+        current_ref_counter = self.param_recompute_ref_count if self.is_recomputing else self.param_fwd_ref_count
+        with torch.no_grad():
+            for param_id in param_ids_in_module:              
+                if param_id in current_ref_counter:
+                    current_ref_counter[param_id] -= 1
+                    if current_ref_counter[param_id] == 0:
+                        param = self.id_to_param_map[param_id]
+                        if hasattr(param, 'fedspeed_status') and param.fedspeed_status == "FULL":
+                            param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+                            param.fedspeed_status = "SHARDED"
+                            del current_ref_counter[param_id]
+
+    def _pre_backward_hook_fn(self, module, grad_output):
+        """在反向传播进入一个子模块之前，重建该模块所需的所有参数。"""
+        logger.debug(f"[PRE-BWD HOOK @ Rank {self.rank}] For {type(module).__name__}")
+
+        # 复用 pre_forward 的参数重建逻辑
+        self._pre_forward_hook_fn(module, None)
+
+    def _post_backward_hook_fn(self, module, grad_input, grad_output):
+        """在反向传播离开一个子模块之后，立即丢弃不再使用的参数。"""
+        logger.debug(f"[POST-BWD HOOK @ Rank {self.rank}] For {type(module).__name__}")
+
+        param_ids_in_module = self.module_to_params_map.get(module.fedspeed_id, [])
+        with torch.no_grad():
+            for param_id in param_ids_in_module:
+                if param_id in self.param_bwd_ref_count:
+                    self.param_bwd_ref_count[param_id] -= 1
+                    if self.param_bwd_ref_count[param_id] == 0:
+                        param = self.id_to_param_map[param_id]
+                        if param.fedspeed_status == "FULL":
+                            param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+                            param.fedspeed_status = "SHARDED"
+                            del self.param_bwd_ref_count[param_id]
+
+    def _collect_grad_hook_factory(self, name):
+        def hook(grad):
+            if grad is not None:
+                self.temp_full_gradients[name] = grad.detach().clone()
+        return hook
+    
+    # --- 核心训练方法 ---
+
+    def forward(self, *args, **kwargs):        
+        # 加载预先计算好的计数
+        self.param_fwd_ref_count = self.param_id_to_fwd_ref_count.copy()
+        # 前向传播
+        outputs = self.model(*args, **kwargs)
+        # 释放参数
+        self._release_all_full_params()
+        return outputs
+
+    def backward(self, loss, *args, **kwargs):
+        logger.debug(f"Rank {self.rank}: Starting backward pass...")
+
+        # 加载预先计算好的计数
+        self.param_bwd_ref_count = self.param_id_to_bwd_ref_count.copy()
+        self.param_recompute_ref_count = self.param_id_to_recompute_ref_count.copy()
+        # 反向传播
+        loss.backward()
+        # 确保所有客户端的backward和所有钩子都已执行完毕
+        dist.barrier()
+        # 计算梯度大小
+        if self.is_first_step:
+            for grad in self.temp_full_gradients.values():
+                self.gradients_mem += grad.numel() * grad.element_size()
+        # 释放参数
+        self._release_all_full_params()
+
+        logger.debug(f"Rank {self.rank}: Backward pass and all gradient hooks finished.")
+
+    def aggregate_gradients(self):
+        """
+        【最终修正版】使用 all_reduce + 本地切片的方式，兼容 gloo 后端。
+        """
+        if self.aggregation_mode == 'model':
+            # 在模型聚合模式下，梯度只在本地使用，不进行分布式聚合
+            return None 
+        else:
+            ordered_full_grads = [self.temp_full_gradients[name] for name in self.ordered_trainable_names]
+            
+            # 1. 打包：将所有完整梯度拉平成一个巨大的、连续的向量
+            flat_full_grads = parameters_to_vector(ordered_full_grads)
+
+            # 2.通信：使用 All-Reduce
+            self.current_step += 1
+            if self.current_step > 0 and (self.current_step % 1) == 0:
+                # logger.info("Aggregate Grads")
+                dist.all_reduce(flat_full_grads, op=dist.ReduceOp.SUM)
+                if self.world_size > 0:
+                    flat_full_grads.div_(self.world_size)
+            
+            # 3. 本地切片 
+            # 3a. 获取所有 rank 的分片大小 (numel)，以确定自己的偏移量
+            my_shard_numel = self.fp32_master_param_shard.numel()
+            all_shard_numels_t = [torch.tensor(0, dtype=torch.long, device=self.device) for _ in range(self.world_size)]
+            dist.all_gather(all_shard_numels_t, torch.tensor(my_shard_numel, dtype=torch.long, device=self.device))
+            split_sizes = [t.item() for t in all_shard_numels_t]
+
+            # 3b. 计算本地分片在完整向量中的偏移量
+            #    偏移量等于所有排在自己前面的 rank 的分片大小之和
+            my_offset = sum(split_sizes[:self.rank])
+            
+            # 3c. 从完整的聚合梯度中，切出属于自己的分片
+            flat_grad_shard = flat_full_grads.narrow(0, my_offset, my_shard_numel)
+            
+            # 清理工作
+            self.temp_full_gradients.clear()
+            
+            # 返回切片后的梯度。注意，它现在是 flat_full_grads 的一个视图 (view)。
+            # 为了安全，返回一个克隆，以防 flat_full_grads 被意外修改。
+            return flat_grad_shard.clone()
+
+    def step(self, flat_grad_shard: torch.Tensor = None):
+        """
+        【重构】根据 self.aggregation_mode 选择不同的更新路径。
+        注意：当模式为 'model' 时，传入的 flat_grad_shard 将被忽略。
+        """
+        if self.aggregation_mode == 'gradient':
+            self._gradient_aggregation_step(flat_grad_shard)
+        elif self.aggregation_mode == 'model':
+            self._model_aggregation_step()
+        else:
+            raise ValueError(f"Unknown aggregation mode: {self.aggregation_mode}")
+
+    def _gradient_aggregation_step(self, flat_grad_shard: torch.Tensor):
+        """执行优化器步骤。用聚合后的梯度分片来更新FP32主权重分片。"""
+        if not self.sharded_optimizer or flat_grad_shard.numel() == 0:
+            logger.warning("Optimizer not ready or no gradients, skipping step.")
+            return
+        logger.debug(f"Rank {self.rank}: Starting optimizer step...")
+
+        # 1. 将这个扁平化的梯度分片，赋给FP32主权重分片的.grad属性。
+        # real_lr_multiplier = 0.001
+        # with torch.no_grad():
+        #     scaled_grad_shard = flat_grad_shard.mul(real_lr_multiplier)
+        self.fp32_master_param_shard.grad = flat_grad_shard.to(self.fp32_master_param_shard.device)
+        # if self.grad_clip_norm > 0:
+        #     clip_grad_norm_(
+        #         self.fp32_master_param_shard, 
+        #         max_norm=self.grad_clip_norm
+        #     )
+        # 2. 调用分片化的优化器，执行一步更新！
+        self.sharded_optimizer.step()
+        self.sharded_optimizer.zero_grad() 
+
+        # 打印内存占用
+        if self.is_first_step:
+            self.is_first_step = False
+            self.profile_sharded_memory()
+
+        # 重置优化器    
+        # self.sharded_optimizer.state.clear()
+        
+        # 4. 将更新后的FP32主权重，写回到模型参数的FP16分片中。
+        shards_to_update = [self.name_to_param_map[name].fedspeed_shard for name in self.ordered_trainable_names]
+        vector_to_parameters(self.fp32_master_param_shard.data, shards_to_update)
+        
+        # 5. 清理未使用的缓存内存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        logger.debug(f"Rank {self.rank}: Optimizer step finished. Model shards updated.")
+        
+    def _model_aggregation_step(self):
+        """
+        【最终完整版】精确模拟 FL 的本地更新与模型聚合。
+        此版本修正了参数排序问题，并整合了所有最终的正确逻辑。
+        """
+        # --- 1. 准备数据 ---
+        
+        # a. [通信] 重建完整的当前模型参数 W_t
+        #    使用在 __init__ 中已经排好序的 self.ordered_trainable_names
+        all_shards_list = []
+        for name in self.ordered_trainable_names:
+            param = self.name_to_param_map[name]
+            # 准备接收缓冲区
+            shard_list = [torch.empty_like(param.fedspeed_shard) for _ in range(self.world_size)]
+            # 收集所有分片
+            dist.all_gather(shard_list, param.fedspeed_shard)
+            # 拼接成完整参数
+            full_param = torch.cat(shard_list, dim=0)
+            all_shards_list.append(full_param)
+            
+        # 将所有完整参数打包成一个向量
+        current_full_params_vec = parameters_to_vector(all_shards_list)
+        
+        # b. 将 W_t 的数据载入到由优化器管理的 self.local_trainable_model 中
+        vector_to_parameters(current_full_params_vec, self.local_trainable_model.parameters())
+        
+        # c. 获取完整的本地梯度，并确保顺序正确
+        local_full_grads_list = [self.temp_full_gradients[name] for name in self.ordered_trainable_names]
+        local_full_grads_vec = parameters_to_vector(local_full_grads_list)
+        self.temp_full_gradients.clear()
+        
+        # d. 将本地梯度写回到本地可训练模型的 .grad 属性中
+        for p in self.local_trainable_model.parameters():
+            if p.grad is None: 
+                p.grad = torch.zeros_like(p)
+        vector_to_parameters(local_full_grads_vec, [p.grad for p in self.local_trainable_model.parameters()])
+        
+        # --- 2. 模拟 LLMTrainer 的本地更新 ---        
+        # a. 【精确模仿】LLMTrainer 的 Bug: 手动缩放梯度
+        # real_lr_multiplier = 0.001 
+        # with torch.no_grad():
+        #     for param in self.local_trainable_model.parameters():
+        #         if param.grad is not None:
+        #             param.grad.mul_(real_lr_multiplier)
+
+        # b. 【精确模仿】使用【持久化】的本地优化器执行一步更新
+        # if self.current_step > 9 and (self.current_step % 10) == 0:
+        #     logger.info("get_optimizer------------")
+        self.local_optimizer.step()
+        self.local_optimizer.zero_grad()
+
+        # local_optimizer = get_optimizer(self.local_trainable_model, **self.cfg.train.optimizer)
+        # local_optimizer.zero_grad() 
+        # local_optimizer.step()
+        # # 打印内存占用
+        # if self.is_first_step:
+        #     self.is_first_step = False
+        #     self.profile_sharded_memory()
+             
+        # --- 3. 聚合更新后的模型参数 ---
+        
+        # a. 将更新后的完整参数打包成一个向量
+        updated_local_full_params_vec = parameters_to_vector(self.local_trainable_model.parameters())
+        
+        # b. [通信] 对该向量进行 all-reduce 平均 (SUM + DIV)，以兼容 Gloo
+        self.current_step += 1
+        if self.current_step > 0 and (self.current_step % 1) == 0:
+            dist.all_reduce(updated_local_full_params_vec, op=dist.ReduceOp.SUM)
+            if self.world_size > 0:
+                updated_local_full_params_vec.div_(self.world_size)
+
+        # # --- 【最终版打印】在 AGGREGATION 之后，逐个参数打印 ---
+        # logger.info(f"--- [FedSpeed Client #{self.rank}] "
+        #             f"Params AFTER AGGREGATION ---")
+        
+        # # 为了逐个参数打印，我们需要将聚合后的向量写回到一个模型结构中
+        # temp_aggregated_model = self.local_trainable_model # 我们可以复用这个结构
+        # vector_to_parameters(updated_local_full_params_vec, temp_aggregated_model.parameters())
+        
+        # total_norm_sq = 0.0
+        # with torch.no_grad():
+        #     for name, param in temp_aggregated_model.named_parameters():
+        #         norm = torch.linalg.norm(param.data.float()).item()
+        #         total_norm_sq += norm ** 2
+        #         logger.info(f"  - Norm of '{name}': {norm:.8f}")
+        # logger.info(f"  - TOTAL PARAMS NORM : {total_norm_sq:.8f}")
+
+        # # --- 打印逻辑结束 ---
+
+        # --- 4. 更新模型分片 (全新的、手动的、最可靠的逻辑) ---
+    
+        current_offset_in_vec = 0
+        # 遍历我们保证了顺序的 ordered_trainable_names
+        for name in self.ordered_trainable_names:
+            param = self.name_to_param_map[name]
+        
+            # a. 从聚合后的大向量中，切出这个参数的【完整】数据
+            numel = param.fedspeed_original_shape.numel()
+            full_param_data = updated_local_full_params_vec.narrow(0, current_offset_in_vec, numel)
+            full_param_data = full_param_data.view(param.fedspeed_original_shape)
+            current_offset_in_vec += numel
+
+            # b. 将这个完整的参数【重新分片】
+            dim_to_split = 0
+            dim_size = full_param_data.shape[dim_to_split]
+            my_new_shard = None
+
+            if dim_size == 0:
+                my_new_shard = torch.empty(0, dtype=full_param_data.dtype, device=self.device)
+            elif dim_size < self.world_size:
+                if self.rank == 0: my_new_shard = full_param_data.clone()
+                else: my_new_shard = torch.empty(0, dtype=full_param_data.dtype, device=self.device)
+            else:
+                # 使用与 CoordinatorEngine 完全相同的分片大小计算逻辑
+                base_size = dim_size // self.world_size
+                rem = dim_size % self.world_size
+                split_sizes = [base_size + 1 if i < rem else base_size for i in range(self.world_size)]
+                shards = torch.split(full_param_data, split_sizes, dim=dim_to_split)
+                my_new_shard = shards[self.rank].clone()
+            
+            # c. 【关键】直接、强制地将新分片数据写入
+            with torch.no_grad():
+                if param.fedspeed_shard.shape != my_new_shard.shape:
+                    param.fedspeed_shard = torch.nn.Parameter(my_new_shard, requires_grad=False)
+                else:
+                    param.fedspeed_shard.data.copy_(my_new_shard)
+
+        # # --- 增加一个“写回后”的验证打印 ---
+        # logger.info(f"--- [FedSpeed Client #{self.rank}] "
+        #             f"Params AFTER WRITING back to shards ---")
+        # with torch.no_grad():
+        #     # 我们直接 all-gather 当前的 p.fedspeed_shard，看看写入是否成功
+        #     # 这个逻辑与您在 trainer 中的打印代码完全一样
+        #     total_norm = 0.0
+        #     for name in self.ordered_trainable_names:
+        #         param = self.name_to_param_map[name]
+        #         shard_list = [torch.empty_like(param.fedspeed_shard) for _ in range(self.world_size)]
+        #         dist.all_gather(shard_list, param.fedspeed_shard)
+        #         full_param_data = torch.cat(shard_list, dim=0)
+        #         norm = torch.linalg.norm(full_param_data.float()).item()
+        #         logger.info(f"  - (Verification) Norm of '{name}': {norm:.8f}")
+        #         total_norm += norm**2
+        #     logger.info(f"  - (Verification) TOTAL PARAMS NORM (L2): {total_norm**0.5:.8f}")
+
+        # 5. 清理未使用的缓存内存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        logger.debug(f"Rank {self.rank}: Optimizer step finished. Model shards updated.")
+
+    def get_my_final_shard(self):
+        """
+        用于在训练结束后，获取最终的、训练好的FP32主参数分片。
+        同时，为了能正确地重组，我们需要知道所有可训练参数的名称和顺序。
+        """
+        if self.fp32_master_param_shard is not None:
+            # 保证顺序对于重组至关重要
+            ordered_trainable_names = sorted(list(self.trainable_param_names))
+            return {
+                'fp32_master_shard': self.fp32_master_param_shard.detach().cpu(),
+                'ordered_trainable_names': ordered_trainable_names
+            }
+        return {}
+        
+    def profile_sharded_memory(self):
+        """计算各类分片化状态的内存占用。"""
+        if not torch.cuda.is_available():
+            return
+            
+        # 1. 模型参数分片 (FP16/BF16)
+        param_shards_mem = 0
+        for param in self.model.parameters():
+            if hasattr(param, 'fedspeed_shard'):
+                param_shards_mem += param.fedspeed_shard.numel() * param.fedspeed_shard.element_size()
+        
+        # 2. FP32 主权重分片
+        if self.aggregation_mode == 'gradient':
+            fp32_master_mem = self.fp32_master_param_shard.numel() * self.fp32_master_param_shard.element_size()
+        elif self.aggregation_mode == 'model':
+            fp32_master_mem = self.fp32_master_param.numel() * self.fp32_master_param.element_size()
+
+        # 3. 优化器状态分片
+        optimizer_states_mem = 0
+        if self.aggregation_mode == 'gradient':
+            if self.sharded_optimizer:
+                for state in self.sharded_optimizer.state.values():
+                    for s in state.values():
+                        if isinstance(s, torch.Tensor):
+                            optimizer_states_mem += s.numel() * s.element_size()
+        elif self.aggregation_mode == 'model':
+            if self.local_optimizer:
+                for state in self.local_optimizer.state.values():
+                    for s in state.values():
+                        if isinstance(s, torch.Tensor):
+                            optimizer_states_mem += s.numel() * s.element_size()
+
+        logger.info("--- [Memory Profile (Sharded States)] ---")
+        logger.info(f"  - Model Param Shards (FP16/BF16): {param_shards_mem / (1024**2):.2f} MB")
+        logger.info(f"  - FP32 Master Param Shard:         {fp32_master_mem / (1024**2):.2f} MB")
+        logger.info(f"  - Full Gradients: {self.gradients_mem / (1024**2):.2f} MB")
+        logger.info(f"  - Optimizer States Shards (Adam):  {optimizer_states_mem / (1024**2):.2f} MB")
+
+    def _release_all_full_params(self):
+        with torch.no_grad():
+            for param in self.model.parameters():
+                if hasattr(param, 'fedspeed_status') and param.fedspeed_status == "FULL":
+                    param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+                    param.fedspeed_status = "SHARDED"
+
+
+class FedSpeedCoordinatorEngine:
+    """
+    【新增】服务器端协调引擎。
+    负责在训练开始前，对完整模型进行所有预处理：
+    1. 参数分片。
+    2. 包装激活检查点。
+    3. 执行一次完整的前向和后向传播“演练”，以计算所有参数的引用计数。
+    4. 将每个客户端所需的分片和引用计数打包。
+    """
+    def __init__(self, model, config, world_size, device='cpu'):
+        self.model = model.to(device) # 演练可以在CPU上进行，节省GPU
+        self.cfg = config
+        self.world_size = world_size
+        self.device = device
+
+        # 演练所需的状态
+        self.param_id_to_fwd_ref_count = {}
+        self.param_id_to_recompute_ref_count = {}
+        self.param_id_to_bwd_ref_count = {}
+        self.is_recomputing = False
+        
+        # 模块和参数映射
+        self.module_to_params_map = {}
+        self.id_to_param_map = {}
+        self._build_module_param_map()
+
+    def _build_module_param_map(self):
+        """在初始化时，遍历一次模型，构建模块到其直属参数的映射。"""
+        for module in self.model.modules():
+            if not hasattr(module, 'fedspeed_id'):
+                module.fedspeed_id = id(module)
+            params_in_module = [id(p) for p in module._parameters.values() if p is not None]
+            self.module_to_params_map[module.fedspeed_id] = params_in_module
+            for param in module._parameters.values():
+                if param is not None:
+                    self.id_to_param_map[id(param)] = param
+
+    def _apply_checkpointing_for_profile(self, block_class):
+        """为演练模型应用激活检查点。"""
+        logger.info(f"[Coordinator] Applying activation checkpointing to {block_class.__name__} for profiling.")
+        from torch.utils.checkpoint import checkpoint
+        for module_to_patch in self.model.modules():
+            if isinstance(module_to_patch, block_class):
+                module_to_patch.original_forward = module_to_patch.forward
+                
+                def new_forward(*args, m=module_to_patch, **kwargs):
+                    def recompute_function(*args, **kwargs):
+                        self.is_recomputing = True
+                        try:
+                            result = m.original_forward(*args, **kwargs)
+                        finally:
+                            self.is_recomputing = False
+                        return result
+                    return checkpoint(recompute_function, *args, use_reentrant=False, **kwargs)
+                module_to_patch.forward = new_forward
+
+    def _profiling_hook_factory(self, ref_counter):
+        """一个通用的钩子工厂，用于在演练时填充引用计数器。"""
+        def hook(module, inputs, outputs=None):
+            param_ids = self.module_to_params_map.get(id(module), [])
+            for param_id in param_ids:
+                ref_counter[param_id] = ref_counter.get(param_id, 0) + 1
+        return hook
+
+    def profile_and_shard(self):
+        """核心方法：执行分片和演练，返回所有客户端的初始化数据包。"""
+        logger.info("[Coordinator] Starting parameter sharding and reference count profiling...")
+        
+        # --- 步骤 1: 参数分片 ---
+        all_param_shards = {rank: {} for rank in range(self.world_size)}
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                dim_to_split = 0
+                dim_size = param.shape[dim_to_split]
+                
+                # 【修改】替换 torch.chunk
+                if dim_size == 0:
+                    shards = [torch.empty(0, dtype=param.dtype) for _ in range(self.world_size)]
+                elif dim_size < self.world_size:
+                    # 规则不变：无法分给每个rank的，由rank 0持有
+                    shards = [param.data.clone() if r == 0 else torch.empty(0, dtype=param.dtype) for r in range(self.world_size)]
+                else:
+                    # 使用自定义的均匀分片逻辑
+                    split_sizes = self._get_even_split_sizes(dim_size)
+                    shards = torch.split(param.data, split_sizes, dim=dim_to_split)
+
+                for rank in range(self.world_size):
+                    # 保存分片、原始形状和名称，这些信息客户端都需要
+                    all_param_shards[rank][name] = {
+                        'shard_data': shards[rank].clone(),
+                        'original_shape': param.shape,
+                        'is_trainable': param.requires_grad
+                    }
+        logger.info("[Coordinator] Parameter sharding complete.")
+
+        # --- 步骤 2: 演练引用计数 ---
+        # 准备一个假的输入
+        dummy_input_ids = torch.ones(1, self.cfg.llm.tok_len, dtype=torch.long, device=self.device)
+        dummy_labels = torch.ones(1, self.cfg.llm.tok_len, dtype=torch.long, device=self.device)
+        dummy_input = {'input_ids': dummy_input_ids, 'labels': dummy_labels}
+
+        # 应用激活检查点 (如果配置了)
+        if self.cfg.federate.use_activation_checkpointing:
+            from federatedscope.llm.trainer.fedspeed_trainer import GPT2Block
+            self._apply_checkpointing_for_profile(GPT2Block)
+
+        # 注册演练钩子
+        fwd_counter, recompute_counter, bwd_counter = {}, {}, {}
+        
+        # 使用一个技巧：在 post-forward 中区分是原始前向还是 recompute
+        def post_fwd_profiling_hook(module, inputs, outputs):
+            counter = recompute_counter if self.is_recomputing else fwd_counter
+            param_ids = self.module_to_params_map.get(id(module), [])
+            for pid in param_ids:
+                counter[pid] = counter.get(pid, 0) + 1
+
+        fwd_handle = self.model.register_forward_hook(post_fwd_profiling_hook)
+        bwd_handle = self.model.register_full_backward_hook(self._profiling_hook_factory(bwd_counter))
+
+        # 执行演练
+        logger.info("[Coordinator] Starting profiling forward pass...")
+        self.model.train()
+        outputs = self.model(**dummy_input)
+        loss = outputs.loss
+        logger.info("[Coordinator] Starting profiling backward pass...")
+        loss.backward()
+        logger.info("[Coordinator] Profiling complete.")
+
+        # 清理钩子
+        fwd_handle.remove()
+        bwd_handle.remove()
+
+        self.param_id_to_fwd_ref_count = fwd_counter
+        self.param_id_to_recompute_ref_count = recompute_counter
+        self.param_id_to_bwd_ref_count = bwd_counter
+
+        # --- 步骤 3: 打包数据 ---
+        all_client_packages = []
+        ref_counts_package = {
+            'fwd': self.param_id_to_fwd_ref_count,
+            'recompute': self.param_id_to_recompute_ref_count,
+            'bwd': self.param_id_to_bwd_ref_count,
+            'id_to_param_map_keys': list(self.id_to_param_map.keys()) # 发送ID列表，客户端重建映射
+        }
+        
+        for rank in range(self.world_size):
+            client_package = {
+                'shards': all_param_shards[rank],
+                'ref_counts': ref_counts_package
+            }
+            all_client_packages.append(client_package)
+        
+        logger.info("[Coordinator] All client packages created successfully.")
+        return all_client_packages
+
+    def _get_even_split_sizes(self, dim_size):
+        """
+        【新增】计算每个 rank 的分片大小，确保尽可能均匀。
+        返回一个列表，包含每个 rank 的分片大小。
+        """
+        if dim_size == 0:
+            return [0] * self.world_size
+        # 基础大小
+        base_size = dim_size // self.world_size
+        # 剩余的元素，分配给前面的 rank
+        rem = dim_size % self.world_size
+        # 每个rank的大小
+        sizes = [base_size + 1 if i < rem else base_size for i in range(self.world_size)]
+        return sizes
+
+
+def natural_sort_key(s):
+    """
+    一个用于 sorted() 的 key 函数，可以实现自然排序 (e.g., 'h.10' 在 'h.2' 之后)。
+    """
+    return [int(text) if text.isdigit() else text.lower()
+            for text in re.split('([0-9]+)', s)]
+
+def log_memory_usage(stage_name):
+    """打印当前 rank 的 GPU 内存使用情况。"""
+    # if torch.cuda.is_available():
+    #     allocated = torch.cuda.memory_allocated("cuda:0") / (1024 ** 2)  # MB
+    #     reserved = torch.cuda.memory_reserved("cuda:0") / (1024 ** 2)    # MB
+    #     max_allocated = torch.cuda.max_memory_allocated("cuda:0") / (1024 ** 2) # MB
+    #     logger.info(
+    #         f"[MemMon][{stage_name}] "
+    #         f"Allocated: {allocated:.2f} MB | "
+    #         f"Reserved: {reserved:.2f} MB | "
+    #         f"Peak Allocated: {max_allocated:.2f} MB"
+    #     )

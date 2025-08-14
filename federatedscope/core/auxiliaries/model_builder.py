@@ -133,10 +133,10 @@ def get_model(config, local_data=None, backend='torch'):
     else:
         input_shape = model_config.input_shape
 
-    if input_shape is None:
-        logger.warning('The input shape is None. Please specify the '
-                       '`data.input_shape`(a tuple) or give the '
-                       'representative data to `get_model` if necessary')
+    # if input_shape is None:
+    #     logger.warning('The input shape is None. Please specify the '
+    #                    '`data.input_shape`(a tuple) or give the '
+    #                    'representative data to `get_model` if necessary')
 
     for func in register.model_dict.values():
         model = func(model_config, input_shape)

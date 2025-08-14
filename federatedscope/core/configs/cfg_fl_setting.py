@@ -35,6 +35,9 @@ def extend_fl_setting_cfg(cfg):
     # the method name is used to internally determine composition of
     # different aggregators, messages, handlers, etc.,
     cfg.federate.method = "FedAvg"
+    cfg.federate.aggregation_mode= 'gradient'
+    cfg.federate.aggregation_steps= 1
+    cfg.federate.use_activation_checkpointing = False
     cfg.federate.ignore_weight = False
     cfg.federate.use_ss = False  # Whether to apply Secret Sharing
     cfg.federate.restore_from = ''
