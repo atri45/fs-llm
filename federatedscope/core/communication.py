@@ -210,3 +210,21 @@ class gRPCCommManager(object):
         message = Message()
         message.parse(received_msg.msg)
         return message
+
+    def receive_nowait(self):
+        """
+        对外暴露非阻塞的 receive 接口，返回一个列表。
+        """
+        # 1. 从底层服务获取消息【列表】
+        received_requests = self.server_funcs.receive_nowait()
+        if received_requests is None:
+            return None
+
+        # 2. 将 Protobuf 请求列表，转换为 Message 对象列表
+        message_list = []
+        for request in received_requests:
+            message = Message()
+            message.parse(request.msg)
+            message_list.append(message)
+            
+        return message_list

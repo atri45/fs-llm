@@ -3,6 +3,20 @@ import torch
 import psutil
 import os
 import logging
+import torch.distributed as dist
+import pickle
+import base64
+import numpy as np
+
+from federatedscope.core.workers.server import Server
+from federatedscope.core.workers.client import Client
+from federatedscope.core.message import Message
+from federatedscope.core.auxiliaries.utils import merge_dict_of_results, add_prefix_to_path
+from federatedscope.llm.trainer.fedspeed_engine import FedSpeedCoordinatorEngine
+from federatedscope.llm.trainer.fedspeed_trainer import FedSpeedTrainer, EarlyStopException
+from torch.nn.utils.convert_parameters import vector_to_parameters
+from collections import OrderedDict
+from federatedscope.core.communication import gRPCCommManager
 
 logger = logging.getLogger(__name__)
 
@@ -72,25 +86,6 @@ class PerformanceMonitor:
         logger.info("------------------------------------------")
 
 
-
-import logging
-import os
-import torch
-import torch.distributed as dist
-import pickle
-import base64
-from collections import OrderedDict
-
-from federatedscope.core.workers.server import Server
-from federatedscope.core.workers.client import Client
-from federatedscope.core.message import Message
-from federatedscope.core.auxiliaries.utils import merge_dict_of_results, add_prefix_to_path
-from federatedscope.llm.trainer.fedspeed_engine import FedSpeedCoordinatorEngine
-from federatedscope.llm.trainer.fedspeed_trainer import FedSpeedTrainer
-from torch.nn.utils.convert_parameters import vector_to_parameters
-from collections import OrderedDict
-logger = logging.getLogger(__name__)
-
 class FedSpeedServer(Server):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -99,10 +94,13 @@ class FedSpeedServer(Server):
         self.fedspeed_participants = []
         self.coordinator_engine = None
         self.final_shards_buffer = {}
+        self.asynchronous = self._cfg.federate.get('asynchronous_aggregation', False)
 
-        # 我们现在只需要一个'ready'信号
         self.register_handlers('fedspeed_ready', self.callback_funcs_for_fedspeed_ready)
-        self.register_handlers('fedspeed_final_shard', self.callback_funcs_for_fedspeed_final_shard)
+        if self.asynchronous == False:
+            #  为同步聚合准备缓冲区
+            self.sync_model_buffer = {}
+            self.register_handlers('sync_model_para', self.callback_funcs_for_sync_model_para)
 
     def trigger_for_start(self):
         if self.check_client_join_in():
@@ -116,7 +114,7 @@ class FedSpeedServer(Server):
                 super().trigger_for_start()
     
     def fedspeed_setup(self):
-        # 把我们之前设计的 fedspeed_setup 逻辑完整地搬到这里
+        # 把之前设计的 fedspeed_setup 逻辑完整地搬到这里
         participants = list(self.comm_manager.neighbors.keys())
         self.world_size = len(participants)
         self.fedspeed_participants = sorted(list(self.comm_manager.neighbors.keys()))
@@ -157,7 +155,7 @@ class FedSpeedServer(Server):
         
         if self.fedspeed_ready_client_count == len(self.fedspeed_participants):
             logger.info("All clients are ready! Server is now profiling and sharding the model...")
-            
+
             # 1. 创建并运行协调引擎
             self.coordinator_engine = FedSpeedCoordinatorEngine(self.model, self._cfg, self.world_size)
             all_client_packages = self.coordinator_engine.profile_and_shard()
@@ -165,9 +163,10 @@ class FedSpeedServer(Server):
 
             # 2. 向每个客户端发送其专属的初始化包
             for i, client_id in enumerate(self.fedspeed_participants):
-                rank = i
-                package_to_send = all_client_packages[rank]
-                
+                package_to_send = all_client_packages[i]
+                address_book = self.comm_manager.get_neighbors()
+                package_to_send['address_book'] = address_book
+
                 # 序列化并发送
                 content = base64.b64encode(pickle.dumps(package_to_send)).decode('ascii')
                 
@@ -180,78 +179,53 @@ class FedSpeedServer(Server):
                 )
             logger.info("All initialization packages have been sent to clients. Start training……")
 
-    def callback_funcs_for_fedspeed_final_shard(self, message: Message):
+    def callback_funcs_for_sync_model_para(self, message: Message):
         """
-        收集所有客户端的最终分片，并在收集完毕后合成并保存完整模型。
+        处理客户端在同步模式下上传的模型参数。
         """
         sender_id = message.sender
-        rank = self.fedspeed_participants.index(sender_id)
+        current_step = message.state
+        params_vec = message.content
         
-        logger.info(f"Received final shard from Client #{sender_id} (Rank {rank}).")
+        # 将收到的模型存入当前 step 的缓冲区
+        if current_step not in self.sync_model_buffer:
+            self.sync_model_buffer[current_step] = {}
+        self.sync_model_buffer[current_step][sender_id] = params_vec
         
-        # 1. 解码并存储分片
-        content = pickle.loads(base64.b64decode(message.content))
-        self.final_shards_buffer[rank] = content
-        
-        # 2. 检查是否所有分片都已收集完毕
-        if len(self.final_shards_buffer) == len(self.fedspeed_participants):
-            logger.info("All final shards received. Synthesizing the final model...")
+        logger.debug(f"Server: Received sync model from Client #{sender_id} for Step #{current_step}. "
+                     f"({len(self.sync_model_buffer[current_step])}/{self.world_size})")
+
+        # 检查是否收齐了所有客户端的模型
+        if len(self.sync_model_buffer[current_step]) == self.world_size:
+            logger.debug(f"Server: All models for Step #{current_step} received. Aggregating and broadcasting...")
             
+            # 执行聚合
+            all_vectors = list(self.sync_model_buffer[current_step].values())
             try:
-                # 3. 合成模型
-                # a. 按照 rank 顺序对收集到的分片进行排序
-                sorted_shards_info = [self.final_shards_buffer[r] for r in range(self.world_size)]
+                # 将 list of lists 转换为 2D NumPy array,这假设所有 list 的长度都相同
+                numpy_array_2d = np.array(all_vectors, dtype=np.float32)
                 
-                # b. 从中提取 FP32 分片并拼接成一个完整的、扁平化的向量
-                fp32_shards = [info['fp32_master_shard'] for info in sorted_shards_info]
-                full_fp32_vector = torch.cat(fp32_shards, dim=0)
-
-                # c. 获取可训练参数的有序列表 (所有客户端的应该都一样，取第一个即可)
-                ordered_trainable_names = sorted_shards_info[0]['ordered_trainable_names']
-
-                # d. 准备一个干净的模型实例，用于加载最终权重
-                final_model = self.model
-                # 首先加载原始的、冻结的参数
-                # (如果只微调adapter，这一步尤其重要，需要保留原始模型)
-                # 我们的 `self.model` 在服务器上是完整的初始模型，正好可以用
-                
-                # e. 筛选出最终模型中可训练的参数
-                trainable_params_in_final_model = [
-                    p for name, p in final_model.named_parameters() 
-                    if name in ordered_trainable_names
-                ]
-
-                # f. 【关键】将完整的 FP32 向量数据写回到模型的可训练参数中
-                vector_to_parameters(full_fp32_vector, trainable_params_in_final_model)
-
-                logger.info("Final model synthesized successfully.")
-
-                # 4. 保存模型
-                save_path_template = self._cfg.federate.save_to
-                
-                if not save_path_template:
-                    logger.warning("`federate.save_to` is not configured. The final model will not be saved.")
-                    # 如果未配置，则直接跳过保存
-                else:
-                    # 我们不加前缀，直接使用用户指定的文件名
-                    # 如果用户想加前缀，应该在配置文件中指定
-                    # 例如 save_to: "final_gpt2.ckpt"
-                    final_model_path = save_path_template
-
-                    # 检查路径中是否包含目录，如果包含，则创建
-                    save_dir = os.path.dirname(final_model_path)
-                    if save_dir and not os.path.exists(save_dir):
-                        os.makedirs(save_dir)
-
-                    # 保存最终的、合成好的模型 state_dict
-                    torch.save(final_model.state_dict(), final_model_path)
-                    logger.info(f"Final synthesized model saved to {final_model_path}")
-
+                # 调用 .mean(axis=0) 高效地计算平均值
+                aggregated_numpy_array = numpy_array_2d.mean(axis=0)
+            
+                # 将聚合后的新模型广播给所有客户端
+                self.comm_manager.send(
+                    Message(msg_type='aggregated_model_para',
+                            sender=self.ID,
+                            receiver=list(self.comm_manager.neighbors.keys()),
+                            state=current_step,
+                            content=aggregated_numpy_array)
+                )
+            
             except Exception as e:
-                logger.error(f"Failed to synthesize or save the final model: {e}", exc_info=True)
+                logger.error(f"Error during aggregation for Step #{current_step}: {e}", exc_info=True)
+                # 清理缓冲区并返回，避免卡死
+                del self.sync_model_buffer[current_step]
+                return
 
-            # 5. 结束联邦学习过程
-            self.is_finish = True
+            # 清理该 step 的缓冲区
+            del self.sync_model_buffer[current_step]
+            
 
 class FedSpeedClient(Client):
     def __init__(self, **kwargs):
@@ -259,17 +233,22 @@ class FedSpeedClient(Client):
         self.my_rank = None
         self.dist_group_initialized = False
         self.monitor = PerformanceMonitor(self.device)
+        self.asynchronous = self._cfg.federate.get('asynchronous_aggregation', False)
 
         self.register_handlers('fedspeed_setup', self.callback_funcs_for_fedspeed_setup)
         self.register_handlers('fedspeed_init_package', self.callback_funcs_for_init_package)
-        
+        if self.asynchronous:
+            self.register_handlers('async_model_para', self.trainer.handle_model)
+        else :
+            self.register_handlers('aggregated_model_para', self.trainer.handle_model)
+
     def callback_funcs_for_fedspeed_setup(self, message: Message):
         if dist.is_initialized():
             logger.warning(f"Client #{self.ID}: Default process group already initialized. Destroying it before creating new FedSpeed group.")
             # 销毁已经存在的默认通信组
             dist.destroy_process_group()
 
-        # 把我们之前设计的客户端建组逻辑完整地搬到这里
+        # 把之前设计的客户端建组逻辑完整地搬到这里
         if self.dist_group_initialized:
             logger.warning(f"Client #{self.ID} received fedspeed_setup, but already initialized.")
             return
@@ -288,7 +267,7 @@ class FedSpeedClient(Client):
                 world_size=config['world_size']
             )
             self.dist_group_initialized = True
-            logger.info(f"Client #{self.ID} (Rank {config['rank']}) successfully joined group. Waiting for initial shards...")
+            logger.info(f"Client #{self.ID} (Rank {config['rank']}) successfully joined group.")
             self.comm_manager.send(
                 Message(msg_type='fedspeed_ready',
                         sender=self.ID,
@@ -301,11 +280,9 @@ class FedSpeedClient(Client):
 
     def callback_funcs_for_init_package(self, message: Message):
         """
-        【修改】接收初始化包，并启动基于 Step 的训练-评估循环。
+        接收初始化包，并启动基于 Step 的训练-评估循环。
         """
         logger.info(f"Client #{self.ID} (Rank {self.my_rank}): Received init package. Starting step-based run.")
-
-        
 
         try:
             # 1. 初始化 Trainer 和 Engine
@@ -314,42 +291,79 @@ class FedSpeedClient(Client):
                 raise TypeError(f"FedSpeedClient is not configured with FedSpeedTrainer.")
             self.trainer.fedspeed_init_package = init_package
 
-            # 3. 现在可以安全地开始训练了
-            logger.info("All setup complete. Starting FedSpeed training...")
+            # 2. 获取并更新 Trainer 的 peers 列表
+            address_book = init_package.get('address_book')
+            if address_book:
+                logger.info(f"Client #{self.ID}: Received address book. Populating neighbors.")
+                for client_id, address in address_book.items():
+                    if client_id != self.ID:
+                        self.comm_manager.add_neighbors(client_id, address)
+            self.trainer.comm_manager = self.comm_manager
+            self.trainer.client_id = self.ID
+            all_neighbors = list(self.comm_manager.neighbors.keys())
+            # 服务器 ID 通常是 0
+            peers = [cid for cid in all_neighbors if cid != self.ID and cid != 0]
+            self.trainer.peers = peers
+
+            # 3 现在可以安全地开始训练了
             self.monitor.start()
+            logger.info("All setup complete. Starting FedSpeed training...")
             self.trainer.train()
+
+        except EarlyStopException:
+            logger.info(f"Client #{self.ID}: Early stopping signal received.")
 
         finally:
             # 4. 无论训练是否成功，都尝试上传最终结果
-            # 这确保了即使训练中途出错，我们也能保存当时的模型状态
+            # 这确保了即使训练中途出错，也能保存当时的模型状态
             logger.info("Training finished or interrupted.")
             self.monitor.stop()
-            self.upload_final_shard()
-                
-    def upload_final_shard(self):
+            if self.trainer.early_stopper and self.trainer.early_stopper.early_stop:
+                self.trainer.early_stopper.load_best_checkpoint(self.trainer.fedspeed_engine)
+            self.save_final_model_locally()
+
+    def save_final_model_locally(self):
         """
-        从 FedSpeedEngine 中提取本地分片并上传。
-        (此方法实现保持不变，是正确的)
+        将最终的【完整】可训练参数保存到本地磁盘。
         """
-        logger.info(f"Client #{self.ID} uploading final parameter shard.")
-        if not hasattr(self.trainer, 'fedspeed_engine') or self.trainer.fedspeed_engine is None:
-            logger.error("Cannot upload shard, FedSpeedEngine not found.")
+        if not (hasattr(self.trainer, 'fedspeed_engine') and self.trainer.fedspeed_engine):
+            logger.error("FedSpeedEngine not found. Cannot save model.")
+            return
+
+        engine = self.trainer.fedspeed_engine
+
+        # --- 两种模式的处理方式 ---
+        final_state_dict_to_save = OrderedDict()
+
+        with torch.no_grad():
+            if engine.aggregation_mode == 'model' or engine.aggregation_mode == 'local-reconstruct':
+                # 在这些模式下，有完整的 FP32 主权重或完整的本地优化器
+                if engine.local_optimizer:
+                    # 从优化器管理的参数中获取【最终状态】
+                    # 这些参数可能是聚合后的，也可能是纯本地训练的，取决于聚合频率
+                    trainable_params = engine.local_optimizer.param_groups[0]['params']
+                    # 将它们打包成一个 state_dict
+                    for i, name in enumerate(engine.ordered_trainable_names):
+                        # 确保保存为 CPU 张量
+                        final_state_dict_to_save[name] = trainable_params[i].data.cpu().clone()
+                else:
+                     logger.warning("Local optimizer not found in 'model' mode. Cannot save model.")
+                     return
+
+        # --- 文件保存逻辑 ---
+        if not final_state_dict_to_save:
+            logger.error("Failed to construct the final state_dict. Model not saved.")
             return
             
-        final_shard_dict = self.trainer.fedspeed_engine.get_my_final_shard()
-
-        # 检查是否获取到了有效的分片
-        if not final_shard_dict:
-            logger.warning(f"Client #{self.ID} obtained an empty final shard dict. Nothing to upload.")
-            return
-
-        content = base64.b64encode(pickle.dumps(final_shard_dict)).decode('ascii')
-        self.comm_manager.send(
-            Message(msg_type='fedspeed_final_shard',
-                    sender=self.ID,
-                    receiver=[self.server_id],
-                    state=self.state,
-                    content=content)
-        )
-        logger.info(f"Client #{self.ID} has sent its final shard.")
-
+        save_dir = self._cfg.federate.get('client_save_path', './fedspeed_final_models/')
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # 构造一个每个客户端独有的文件名
+        # "gpt2_lora_final.ckpt" -> "client_1_gpt2_lora_final.ckpt"
+        base_filename = self._cfg.federate.save_to
+        final_filename = f"client_{self.ID}_{base_filename}"
+        save_path = os.path.join(save_dir, final_filename)
+        
+        # 保存
+        torch.save(final_state_dict_to_save, save_path)
+        logger.info(f"Client #{self.ID}: Best eval loss： {self.trainer.early_stopper.best_score}. Final trainable parameters saved to {save_path}")

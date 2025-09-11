@@ -1,13 +1,14 @@
 use_gpu: True
 early_stop:
-  patience: 0
+  patience: 3
 federate:
   method: fedspeed
-  aggregation_mode: 'model'
-  aggregation_steps: 10
+  aggregation_mode: 'local-reconstruct'
+  asynchronous_aggregation: True
+  use_activation_checkpointing: True
+  use_offline_model: True
   mode: distributed
   client_num: 2
-  total_round_num: 1
   save_to: "gpt2_alpaca.ckpt"
 data:
   root: data/
@@ -28,7 +29,7 @@ llm:
     max_len: 1000
   adapter:
     use: True
-    args: [ { 'adapter_package': 'peft', 'adapter_method': 'lora', 'r': 8, 'lora_alpha': 32, 'lora_dropout': 0.1, 'target_modules': ['c_attn'] } ]
+    args: [ { 'adapter_package': 'peft', 'adapter_method': 'lora', 'r': 8, 'lora_alpha': 32, 'lora_dropout': 0.1 } ]
   deepspeed:
     use: False
     ds_config: 'federatedscope/llm/baseline/deepspeed/ds_config.json'
@@ -41,7 +42,7 @@ dataloader:
 model:
   type: 'gpt2@huggingface_llm'
 train:
-  local_update_steps: 500
+  local_update_steps: 5000
   batch_or_epoch: batch
   optimizer:
     lr: 0.001
@@ -51,6 +52,6 @@ criterion:
 trainer:
   type: fedspeedtrainer
 eval:
-  freq: 10
+  freq: 100
   metrics: ['loss']
   count_flops: False

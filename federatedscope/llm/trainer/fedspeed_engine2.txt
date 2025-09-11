@@ -276,7 +276,6 @@ class FedSpeedEngine:
         self.two_stage = self.cfg.federate.get('two_stage_training', False)
         self.stage_one_steps = self.cfg.federate.get('stage_one_steps', 250)
         self.local_trainable_names_stage1 = None
-        self.should_aggregate = False
         # for 'gradient' mode
         self.fp32_master_param_shard = None
         self.sharded_optimizer = None
@@ -742,9 +741,9 @@ class FedSpeedEngine:
         logger.debug(f"[POST-FWD HOOK @ Rank {self.rank}] For {type(module).__name__}")
 
         # 1. 参数释放
-        # if self.aggregation_mode == 'model':
-        #     self._release_all_full_params()
-        if self.aggregation_mode == 'gradient':
+        if self.aggregation_mode == 'model':
+            self._release_all_full_params()
+        elif self.aggregation_mode == 'gradient':
             param_ids_in_module = self.module_to_params_map.get(id(module), [])
             current_ref_counter = self.param_recompute_ref_count if self.is_recomputing else self.param_fwd_ref_count
             with torch.no_grad():
@@ -818,9 +817,9 @@ class FedSpeedEngine:
         logger.debug(f"[POST-BWD HOOK @ Rank {self.rank}] For {type(module).__name__}")
 
         # 1. 参数释放
-        # if self.aggregation_mode == 'model':
-        #     self._release_all_full_params()
-        if self.aggregation_mode == 'gradient':
+        if self.aggregation_mode == 'model':
+            self._release_all_full_params()
+        elif self.aggregation_mode == 'gradient':
             param_ids_in_module = self.module_to_params_map.get(id(module), [])
             current_ref_counter = self.param_recompute_ref_count if self.is_recomputing else self.param_bwd_ref_count
             with torch.no_grad():
@@ -875,7 +874,7 @@ class FedSpeedEngine:
         loss.backward()
 
         # 确保所有客户端的backward和所有钩子都已执行完毕
-        # dist.barrier()
+        dist.barrier()
 
         # 计算梯度大小
         if self.is_first_step:
@@ -932,12 +931,14 @@ class FedSpeedEngine:
         【重构】根据 self.aggregation_mode 选择不同的更新路径。
         注意：当模式为 'model' 时，传入的 flat_grad_shard 将被忽略。
         """
-        if self.aggregation_mode in ['model', 'local-reconstruct']:
-            return self._local_reconstruct_step()
+        if self.aggregation_mode == 'local-reconstruct':
+            self._model_aggregation_step()
         elif self.aggregation_mode == 'gradient':
             self._gradient_aggregation_step(flat_grad_shard)
+        elif self.aggregation_mode == 'model':
+            self._model_aggregation_step()
         elif self.aggregation_mode == 'fl-sim':
-            return self._fl_sim_step()
+            self._fl_sim_step()
         else:
             raise ValueError(f"Unknown aggregation mode: {self.aggregation_mode}")
 
@@ -945,63 +946,75 @@ class FedSpeedEngine:
         """
         'local-reconstruct' 模式的 step 逻辑，支持同步和异步聚合。
         """
-        if not self.local_optimizer: return None
+        if not self.local_optimizer: return
 
-        # --- 阶段性梯度处理 ---
-        if self.two_stage and self.current_step < self.stage_one_steps:
-            # --- 第一阶段：梯度掩码 ---
-            with torch.no_grad():
-                # 遍历优化器管理的所有参数
-                for param in self.local_optimizer.param_groups[0]['params']:
-                    # 找到参数的全局名称
-                    param_name = param.fedspeed_name # 假设 param 对象有这个属性
-                    
-                    # 如果这个参数不属于本地子集，则将其梯度清零
-                    if param_name not in self.local_trainable_names_stage1:
-                        if param.grad is not None:
-                            param.grad.zero_()
+        # 在 step 之前获取锁
+        with self.trainable_params_lock:
+            # --- 阶段性梯度处理 ---
+            if self.two_stage and self.current_step < self.stage_one_steps:
+                # --- 第一阶段：梯度掩码 ---
+                with torch.no_grad():
+                    # 遍历优化器管理的所有参数
+                    for param in self.local_optimizer.param_groups[0]['params']:
+                        # 找到参数的全局名称
+                        param_name = param.fedspeed_name # 假设 param 对象有这个属性
+                        
+                        # 如果这个参数不属于本地子集，则将其梯度清零
+                        if param_name not in self.local_trainable_names_stage1:
+                            if param.grad is not None:
+                                param.grad.zero_()
 
-        # 1. 本地更新
-        # 梯度已经在 backward 过程中被附加到了【完整】可训练参数上，直接调用优化器执行一步本地更新
-        self.local_optimizer.step()
-        self.local_optimizer.zero_grad()
-        self.current_step += 1
+            # 1. 本地更新
+            # 梯度已经在 backward 过程中被附加到了【完整】可训练参数上，直接调用优化器执行一步本地更新
+            self.local_optimizer.step()
+            self.local_optimizer.zero_grad()
+            self.current_step += 1
 
-        # 打印内存占用
-        if self.current_step == 1:
-            self.profile_sharded_memory()
+            # 打印内存占用
+            if self.current_step == 1:
+                self.profile_sharded_memory()
 
-        # # 2. 检查是否需要聚合
-        self.should_aggregate = False
-        if self.two_stage:
-            if self.current_step == self.stage_one_steps:
-                # 阶段转换点，强制聚合
-                self.should_aggregate = True
-                logger.info(f"--- [Stage Transition] Step #{self.current_step} ---")
-            elif self.current_step > self.stage_one_steps and self.current_step % self.aggregation_steps == 0:
-                # 第二阶段，按频率聚合
-                self.should_aggregate = True
-            # else: 第一阶段，不聚合
-        else: # 非两阶段模式
-            if self.current_step % self.aggregation_steps == 0:
-                self.should_aggregate = True
-        
-        # 返回要发送的参数
-        if self.should_aggregate:
-            trainable_params = self.local_optimizer.param_groups[0]['params']
-            params_to_send_vec = parameters_to_vector([p.data for p in trainable_params]).clone()
-
-            # 清理未使用的缓存内存
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            return params_to_send_vec
+            # # 2. 检查是否需要聚合
+            should_aggregate = False
+            if self.two_stage:
+                if self.current_step == self.stage_one_steps:
+                    # 阶段转换点，强制聚合
+                    should_aggregate = True
+                    logger.info(f"--- [Stage Transition] Aggregating at Step #{self.current_step} ---")
+                elif self.current_step > self.stage_one_steps and self.current_step % self.aggregation_steps == 0:
+                    # 第二阶段，按频率聚合
+                    should_aggregate = True
+                    logger.info(f"--- [Stage 2] Aggregating at Step #{self.current_step} ---")
+                # else: 第一阶段，不聚合
+            else: # 非两阶段模式
+                if self.current_step % self.aggregation_steps == 0:
+                    should_aggregate = True
+                    logger.info(f"--- [FedSpeed-Model] Aggregating at Step #{self.current_step} ---")
+            
+            # 使用 CommManager 进行异步广播
+            if should_aggregate:
+                logger.info(f"Rank {self.rank}: Asynchronously broadcasting model at Step #{self.current_step}.")            
+                # 1. 准备要发送的模型数据
+                params_to_send_vec = parameters_to_vector(
+                    [p.data for p in self.local_optimizer.param_groups[0]['params']]
+                ).clone()
+            
+                # 2. 准备一个信令张量
+                #    它可以是空的，或者包含一些元信息，如 step 编号
+                signal_tensor = torch.tensor([self.current_step], 
+                                            dtype=torch.long, device=self.device)
+            
+                # 3. 遍历所有 peers，先发信令，再发数据
+                for i in range(self.world_size):
+                    if i != self.rank:
+                        # a. 发送信令 (阻塞式 send，因为信令很小，很快)
+                        dist.send(signal_tensor, dst=i)
+                        # b. 发送真正的数据 (非阻塞 isend)
+                        dist.send(self.params_to_send_vec, dst=i)
         
         # 3. 清理未使用的缓存内存
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        
-        return None
 
     def _gradient_aggregation_step(self, flat_grad_shard: torch.Tensor):
         """执行优化器步骤。用聚合后的梯度分片来更新FP32主权重分片。"""
@@ -1073,23 +1086,23 @@ class FedSpeedEngine:
             self.profile_sharded_memory()
 
         # 2. 检查是否需要聚合
-        self.should_aggregate = False
+        should_aggregate = False
         if self.two_stage:
             if self.current_step == self.stage_one_steps:
                 # 阶段转换点，强制聚合
-                self.should_aggregate = True
+                should_aggregate = True
                 logger.info(f"--- [Stage Transition] Aggregating at Step #{self.current_step} ---")
             elif self.current_step > self.stage_one_steps and self.current_step % self.aggregation_steps == 0:
                 # 第二阶段，按频率聚合
-                self.should_aggregate = True
+                should_aggregate = True
                 logger.info(f"--- [Stage 2] Aggregating at Step #{self.current_step} ---")
             # else: 第一阶段，不聚合
         else: # 非两阶段模式
              if self.current_step % self.aggregation_steps == 0:
-                 self.should_aggregate = True
+                 should_aggregate = True
                  logger.info(f"--- [FedSpeed-Model] Aggregating at Step #{self.current_step} ---")
 
-        if self.should_aggregate:            
+        if should_aggregate:            
             # a. 将本地更新后的【完整】可训练参数打包成一个向量
             trainable_params_in_order = self.local_optimizer.param_groups[0]['params']
             updated_local_full_params_vec = parameters_to_vector(
@@ -1117,7 +1130,7 @@ class FedSpeedEngine:
         """
         完全模拟传统 FL 的 step 逻辑。
         """
-        if not self.local_optimizer: return None
+        if not self.local_optimizer: return
 
         # 1. 本地更新 (在高精度上进行)
         self.local_optimizer.step()
@@ -1129,74 +1142,43 @@ class FedSpeedEngine:
             self.profile_sharded_memory()
 
         # 3. 检查是否需要聚合
-        self.should_aggregate = False
         if self.current_step % self.aggregation_steps == 0:
-            self.should_aggregate = True
-            trainable_params = self.local_optimizer.param_groups[0]['params']
-            params_to_send_vec = parameters_to_vector([p.data for p in trainable_params]).clone()
+            logger.info(f"--- [FL-Sim] Aggregating model at Global Step #{self.current_step} ---")
+            
+            # a. 将本地更新后的【完整】可训练参数打包成一个向量
+            trainable_params_in_order = self.local_optimizer.param_groups[0]['params']
+            updated_local_full_params_vec = parameters_to_vector(
+                [p.data for p in trainable_params_in_order]
+            )
 
-            # 清理未使用的缓存内存
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # b. 对该向量进行 all-reduce 平均 (SUM + DIV)
+            dist.all_reduce(updated_local_full_params_vec, op=dist.ReduceOp.SUM)
+            if self.world_size > 0:
+                updated_local_full_params_vec.div_(self.world_size)
 
-            return params_to_send_vec
+            # c. 将聚合后的参数写回到模型中
+            vector_to_parameters(updated_local_full_params_vec, trainable_params_in_order)
 
         # 4. 清理未使用的缓存内存
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        return None
+        logger.debug(f"Rank {self.rank}: Optimizer step finished. Model shards updated.")
 
-    def update_model(self, received_params_vec: torch.Tensor):
-        """由 Trainer 调用的、用于【同步】更新的方法。"""
-        with torch.no_grad():
-            trainable_params_in_order = [self.name_to_param_map[name] for name in self.ordered_trainable_names]
-            vector_to_parameters(received_params_vec.to(self.device), trainable_params_in_order)
 
-    def aggregate_model(self, received_params_vec: torch.Tensor, alpha: float):
+    def get_my_final_shard(self):
         """
-        由 Trainer 调用的、纯计算的聚合方法。
+        用于在训练结束后，获取最终的、训练好的FP32主参数分片。
+        同时，为了能正确地重组，需要知道所有可训练参数的名称和顺序。
         """
-        with torch.no_grad():
-            trainable_params_in_order = [self.name_to_param_map[name] for name in self.ordered_trainable_names]
-            current_params_vec = parameters_to_vector([p.data for p in trainable_params_in_order])
-            current_params_vec.mul_(1 - alpha).add_(received_params_vec.to(self.device), alpha=alpha)
-            vector_to_parameters(current_params_vec, trainable_params_in_order)
-
-    def get_full_trainable_params_as_vector(self) -> torch.Tensor:
-        """
-        直接从【本地优化器】中获取完整的、高精度的可训练参数，并返回一个扁平化的向量。
-        """
-        if not self.local_optimizer:
-            logger.warning("`get_full_trainable_params_as_vector` called but local_optimizer is not initialized.")
-            return torch.tensor([])
-
-        # 优化器管理的参数就是最新的 FP32 状态
-        params_to_vectorize = self.local_optimizer.param_groups[0]['params']
-        return parameters_to_vector([p.data for p in params_to_vectorize]).clone()
-
-    def set_full_trainable_params_from_vector(self, full_vector: torch.Tensor):
-        """
-        从一个完整的 FP32 向量中，恢复所有可训练参数的状态。
-        """
-        if not self.local_optimizer:
-            logger.warning("`set_full_trainable_params_from_vector` called but local_optimizer is not initialized.")
-            return
-        
-        # 1. 直接将数据写入由优化器管理的参数
-        params_to_update = self.local_optimizer.param_groups[0]['params']
-        vector_to_parameters(full_vector, params_to_update)
-
-        # 2. 将更新后的高精度参数，写回到【低精度】的模型中
-        with torch.no_grad():
-            trainable_params_in_model = [
-                self.name_to_param_map[name] 
-                for name in self.ordered_trainable_names
-            ]
-            
-            params_to_write_vec = parameters_to_vector(params_to_update)
-            params_to_write_vec = params_to_write_vec.to(trainable_params_in_model[0].dtype)
-            vector_to_parameters(params_to_write_vec, trainable_params_in_model)
+        if self.fp32_master_param_shard is not None:
+            # 保证顺序对于重组至关重要
+            ordered_trainable_names = sorted(list(self.trainable_param_names))
+            return {
+                'fp32_master_shard': self.fp32_master_param_shard.detach().cpu(),
+                'ordered_trainable_names': ordered_trainable_names
+            }
+        return {}
         
     def profile_sharded_memory(self):
         """计算各类分片化状态的内存占用。"""

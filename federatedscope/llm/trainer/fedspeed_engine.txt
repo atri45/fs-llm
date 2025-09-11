@@ -88,7 +88,7 @@ class FedSpeedEngine:
                 self.name_to_param_map[name] = param
 
         # 服务端和客户端的模型结构和参数ID必须一致
-        # 我们用服务端发来的ID列表来重建id_to_param_map
+        # 用服务端发来的ID列表来重建id_to_param_map
         all_params = list(self.model.parameters())
         if len(id_to_param_map_keys) != len(all_params):
              raise ValueError("Mismatch in parameter count between server and client model.")
@@ -125,7 +125,7 @@ class FedSpeedEngine:
         self.fp32_master_param_shard = parameters_to_vector(trainable_shards).clone().float().detach()
         self.fp32_master_param_shard.requires_grad = True
         
-        # (复用我们之前写好的动态优化器创建逻辑)
+        # (复用之前写好的动态优化器创建逻辑)
         optimizer_config = self.cfg.train.optimizer
         optimizer_kwargs = copy.deepcopy(optimizer_config)
         optimizer_type = optimizer_kwargs.pop('type')
@@ -508,8 +508,8 @@ class FedSpeedEngine:
         # logger.info(f"--- [FedSpeed Client #{self.rank}] "
         #             f"Params AFTER AGGREGATION ---")
         
-        # # 为了逐个参数打印，我们需要将聚合后的向量写回到一个模型结构中
-        # temp_aggregated_model = self.local_trainable_model # 我们可以复用这个结构
+        # # 为了逐个参数打印，需要将聚合后的向量写回到一个模型结构中
+        # temp_aggregated_model = self.local_trainable_model # 可以复用这个结构
         # vector_to_parameters(updated_local_full_params_vec, temp_aggregated_model.parameters())
         
         # total_norm_sq = 0.0
@@ -525,7 +525,7 @@ class FedSpeedEngine:
         # --- 4. 更新模型分片 (全新的、手动的、最可靠的逻辑) ---
     
         current_offset_in_vec = 0
-        # 遍历我们保证了顺序的 ordered_trainable_names
+        # 遍历保证了顺序的 ordered_trainable_names
         for name in self.ordered_trainable_names:
             param = self.name_to_param_map[name]
         
@@ -564,7 +564,7 @@ class FedSpeedEngine:
         # logger.info(f"--- [FedSpeed Client #{self.rank}] "
         #             f"Params AFTER WRITING back to shards ---")
         # with torch.no_grad():
-        #     # 我们直接 all-gather 当前的 p.fedspeed_shard，看看写入是否成功
+        #     # 直接 all-gather 当前的 p.fedspeed_shard，看看写入是否成功
         #     # 这个逻辑与您在 trainer 中的打印代码完全一样
         #     total_norm = 0.0
         #     for name in self.ordered_trainable_names:
@@ -586,7 +586,7 @@ class FedSpeedEngine:
     def get_my_final_shard(self):
         """
         用于在训练结束后，获取最终的、训练好的FP32主参数分片。
-        同时，为了能正确地重组，我们需要知道所有可训练参数的名称和顺序。
+        同时，为了能正确地重组，需要知道所有可训练参数的名称和顺序。
         """
         if self.fp32_master_param_shard is not None:
             # 保证顺序对于重组至关重要
@@ -645,7 +645,7 @@ class FedSpeedEngine:
 
 class FedSpeedCoordinatorEngine:
     """
-    【新增】服务器端协调引擎。
+    服务器端协调引擎。
     负责在训练开始前，对完整模型进行所有预处理：
     1. 参数分片。
     2. 包装激活检查点。
@@ -800,7 +800,7 @@ class FedSpeedCoordinatorEngine:
 
     def _get_even_split_sizes(self, dim_size):
         """
-        【新增】计算每个 rank 的分片大小，确保尽可能均匀。
+        计算每个 rank 的分片大小，确保尽可能均匀。
         返回一个列表，包含每个 rank 的分片大小。
         """
         if dim_size == 0:

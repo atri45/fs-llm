@@ -36,8 +36,22 @@ def extend_fl_setting_cfg(cfg):
     # different aggregators, messages, handlers, etc.,
     cfg.federate.method = "FedAvg"
     cfg.federate.aggregation_mode= 'gradient'
-    cfg.federate.aggregation_steps= 1
-    cfg.federate.use_activation_checkpointing = False
+    cfg.federate.aggregation_steps= 20
+    cfg.federate.asynchronous_aggregation = False
+    cfg.federate.model_cache_path='./model_cache/'
+    cfg.federate.use_offline_model= False
+    cfg.federate.gpu_mem_pressure_threshold= 0.9
+    cfg.federate.cpu_mem_pressure_threshold= 0.9
+    cfg.federate.prefetch_depth= 2
+    cfg.federate.transformer_block_class_name= 'GPT2Block'
+    cfg.federate.two_stage_training= True
+    cfg.federate.stage_one_steps= 250
+    cfg.federate.use_activation_checkpointing = True
+    cfg.federate.adaptive_weight= CN()
+    cfg.federate.adaptive_weight.use= True
+    cfg.federate.adaptive_weight.type= 'exponential'
+    cfg.federate.adaptive_weight.decay_rate= 0.9
+    cfg.federate.gossip_num= -1
     cfg.federate.ignore_weight = False
     cfg.federate.use_ss = False  # Whether to apply Secret Sharing
     cfg.federate.restore_from = ''

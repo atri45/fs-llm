@@ -62,16 +62,6 @@ class LLMTrainer(GeneralTorchTrainer):
         ctx.ys_prob = CtxVar([], LIFECYCLE.ROUTINE)
 
     def _hook_on_batch_forward(self, ctx):
-
-        # logger.info(f"--- [FL Client #{ctx.cfg.distribute.data_idx}] "
-        #             f"Params BEFORE FORWARD at Round ---")
-        # with torch.no_grad():
-        #     for name, param in ctx.model.named_parameters():
-        #         if param.requires_grad:
-        #             norm = torch.linalg.norm(param.data.float()).item()
-        #             logger.info(f"  - Norm of '{name}': {norm:.8f}")
-        # # --- 打印逻辑结束 ---
-
         input_ids = ctx.data_batch['input_ids'].to(ctx.device)
         labels = ctx.data_batch['labels'].to(ctx.device)
         attention_mask = ctx.data_batch['attention_mask'].to(ctx.device)
@@ -119,25 +109,6 @@ class LLMTrainer(GeneralTorchTrainer):
             log_memory_usage("Backward Start")
             real_lr = 0.001
             ctx.loss_task.backward()
-
-            # # --- 在这里打印梯度 ---
-            # logger.info(f"--- [FL Trainer] Gradients at Round #---")
-            # total_grad_norm = 0.0
-            # # 我们只打印可训练的 (LoRA) 参数的梯度
-            # for name, param in ctx.model.named_parameters():
-            #     if param.requires_grad and param.grad is not None:
-            #         grad_norm = torch.linalg.norm(param.grad.detach().float()).item()
-            #         total_grad_norm += grad_norm ** 2
-            #         # 打印每个 LoRA 参数梯度的 L2 范数，这是一个很好的摘要信息
-            #         logger.info(f"  - Grad norm of '{name}': {grad_norm:.6f}")
-            # total_grad_norm = total_grad_norm ** 0.5
-            # logger.info(f"  - TOTAL GRAD NORM (L2): {total_grad_norm:.6f}")
-            # # --- 打印逻辑结束 ---
-
-            # with torch.no_grad():
-            #     for param in ctx.model.parameters():
-            #         if param.grad is not None:
-            #             param.grad.mul_(real_lr)
             log_memory_usage("Backward End (Grads Collected)")
             if ctx.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(ctx.model.parameters(),
@@ -145,46 +116,6 @@ class LLMTrainer(GeneralTorchTrainer):
             log_memory_usage("Step Start")
             ctx.optimizer.step()
 
-            # # --- 打印【本地更新后】的参数范数 ---
-            # total_norm_sq = 0.0
-            # with torch.no_grad():
-            #     # 我们只打印可训练的 (LoRA) 参数
-            #     for name, param in ctx.model.named_parameters():
-            #         if param.requires_grad:
-            #             norm = torch.linalg.norm(param.data.float()).item()
-            #             total_norm_sq += norm ** 2
-            #             logger.info(f"  - Norm of '{name}': {norm:.8f}")
-            # logger.info(f"  - TOTAL PARAMS NORM: {total_norm_sq:.8f}")
-            # --- 打印逻辑结束 ---
-        #     # --- 在 step() 之后打印优化器状态 ---
-        #     logger.info(f"--- [FL Trainer] Optimizer State after Step at Round ---")
-        #     total_state_mem = 0
-            
-        #     # 检查 state 是否为空
-        #     if not ctx.optimizer.state:
-        #         logger.info("  - Optimizer state is empty.")
-            
-        #     # 遍历优化器状态字典
-        #     for param, state in ctx.optimizer.state.items():
-        #         # 找到这个参数的名称，以便更好地识别
-        #         param_name = "Unknown"
-        #         for name, p in ctx.model.named_parameters():
-        #             if id(p) == id(param):
-        #                 param_name = name
-        #                 break
-
-        #         logger.info(f"  - State for param '{param_name}':")
-        #         for key, value in state.items():
-        #             if isinstance(value, torch.Tensor):
-        #                 mem_bytes = value.numel() * value.element_size()
-        #                 total_state_mem += mem_bytes
-        #                 norm = torch.linalg.norm(value.float()).item()
-        #                 logger.info(f"    - '{key}': shape={list(value.shape)}, norm={norm:.6f}, mem={mem_bytes/1024:.2f} KB")
-        #             else:
-        #                 logger.info(f"    - '{key}': {value}")
-            
-        #     logger.info(f"  - TOTAL OPTIMIZER STATE MEMORY: {total_state_mem / (1024**2):.4f} MB")
-        # # --- 打印逻辑结束 ---
             log_memory_usage("Step End")
         if ctx.scheduler is not None:
             ctx.scheduler.step()
