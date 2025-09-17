@@ -251,7 +251,7 @@ class Client(BaseClient):
                 host=host,
                 port=port,
                 client_num=self._cfg.federate.client_num,
-                cfg=self._cfg.distribute)
+                cfg=self._cfg)
             logger.info('Client: Listen to {}:{}...'.format(host, port))
             self.comm_manager.add_neighbors(neighbor_id=server_id,
                                             address={

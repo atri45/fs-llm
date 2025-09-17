@@ -342,7 +342,7 @@ class FedSpeedEngine:
 
     def aggregate_gradients(self):
         """
-        【最终修正版】使用 all_reduce + 本地切片的方式，兼容 gloo 后端。
+        使用 all_reduce + 本地切片的方式，兼容 gloo 后端。
         """
         if self.aggregation_mode == 'model':
             # 在模型聚合模式下，梯度只在本地使用，不进行分布式聚合
@@ -435,7 +435,7 @@ class FedSpeedEngine:
         
     def _model_aggregation_step(self):
         """
-        【最终完整版】精确模拟 FL 的本地更新与模型聚合。
+        精确模拟 FL 的本地更新与模型聚合。
         此版本修正了参数排序问题，并整合了所有最终的正确逻辑。
         """
         # --- 1. 准备数据 ---
@@ -718,7 +718,7 @@ class FedSpeedCoordinatorEngine:
                 dim_to_split = 0
                 dim_size = param.shape[dim_to_split]
                 
-                # 【修改】替换 torch.chunk
+                # 替换 torch.chunk
                 if dim_size == 0:
                     shards = [torch.empty(0, dtype=param.dtype) for _ in range(self.world_size)]
                 elif dim_size < self.world_size:

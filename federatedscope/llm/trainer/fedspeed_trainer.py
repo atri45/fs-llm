@@ -14,6 +14,7 @@ from federatedscope.register import register_trainer
 from federatedscope.core.message import Message
 from torch.nn.utils.convert_parameters import vector_to_parameters, parameters_to_vector
 from federatedscope.core.auxiliaries.ReIterator import ReIterator
+from federatedscope.llm.trainer.anonymous_router import AnonymousRouter
 
 logger = logging.getLogger(__name__)
 
@@ -89,12 +90,16 @@ class FedSpeedTrainer(LLMTrainer):
         self.client_id = -1
         self.peers = []
         self.num_batches = 0
+        self.router = None
+
         self.aggregation_mode = self.config.federate.get('aggregation_mode') 
         self.aggregation_steps = self.config.federate.get('aggregation_steps') 
         self.asynchronous = self._cfg.federate.get('asynchronous_aggregation', False)
         self.adaptive_weight_cfg = self.cfg.federate.get('adaptive_weight', {'use': False})
         self.gossip_num = self._cfg.federate.get('gossip_num', 1)
         self.eval_freq = self._cfg.eval.get('freq')
+        self.anonymous_routing = self.cfg.federate.get('anonymous_routing', False)
+        
         if self.cfg.early_stop.patience > 0:
             self.early_stopper = EarlyStopper(
                 patience=self.cfg.early_stop.patience,
@@ -102,7 +107,6 @@ class FedSpeedTrainer(LLMTrainer):
             )
         else:
             self.early_stopper = None
-
 
     def _hook_on_fit_start_init(self, ctx):
         super()._hook_on_fit_start_init(ctx)
@@ -144,26 +148,6 @@ class FedSpeedTrainer(LLMTrainer):
             # 在所有训练开始前，启动 Reconstructor 的后台线程
             if self.fedspeed_engine and self.fedspeed_engine.reconstructor:
                 self.fedspeed_engine.reconstructor.start()
-
-    def _calculate_adaptive_alpha(self, received_step):
-        """一个辅助函数，用于计算自适应的聚合权重。"""
-        initial_alpha = 0.5
-        staleness = (self.current_step - received_step) / self.aggregation_steps
-        logger.debug(f"staleness: {staleness}")
-        # 如果消息来自未来，则不认为是陈旧的
-        if staleness < 0: 
-            return initial_alpha
-            
-        func_type = self.adaptive_weight_cfg.get('type', 'constant')
-        if func_type == 'exponential':
-            decay_rate = self.adaptive_weight_cfg.get('decay_rate', 0.9)
-            return initial_alpha * (decay_rate ** staleness)
-        elif func_type == 'linear':
-            decay_factor = self.adaptive_weight_cfg.get('decay_factor', 0.01)
-            return max(0.0, initial_alpha - staleness * decay_factor)
-        # ... (可以扩展其他函数)
-        else: # 'constant'
-            return initial_alpha
 
     # 将所有复杂逻辑都委托给 Engine
     def _hook_on_batch_forward(self, ctx):
@@ -220,7 +204,33 @@ class FedSpeedTrainer(LLMTrainer):
 
         # 3. 模型聚合
         if params_to_send is not None:
-            if self.asynchronous:
+            if self.asynchronous and self.anonymous_routing:
+                # --- A. 异步 + 匿名路由模式 ---
+                if not self.router:
+                    logger.error("Anonymous routing is enabled, but the router is not initialized.")
+                    return
+                
+                # 1. 随机选择一个【最终目标】客户端
+                if not self.peers:
+                    logger.warning("No peers to send anonymous message to. Skipping.")
+                    return
+                target_id = random.choice(self.peers)
+                
+                # 2. 调用 Router 构建并加密路由
+                first_hop_id, final_message_content = self.router.build_anonymous_route(
+                    params_to_send, target_id, self.current_step
+                )
+                
+                # 3. 将加密后的消息发送给【路径的第一跳】
+                if first_hop_id:
+                    self.comm_manager.send(
+                        Message(msg_type='anonymous_forward',
+                                sender=self.client_id,
+                                receiver=[first_hop_id],
+                                state=self.current_step,
+                                content=final_message_content)
+                    )
+            elif self.asynchronous:
                 receivers = []
                 if self.gossip_num >= 1:
                     # --- Gossip 模式 ---
@@ -247,76 +257,148 @@ class FedSpeedTrainer(LLMTrainer):
                             state=self.current_step,
                             content=params_to_send.cpu())
                 )
+
+        # 4. 处理消息队列
         if self.aggregation_mode != 'gradient':
             if self.asynchronous:
                 while True:
-                    message_list = self.comm_manager.receive_nowait()
-                    if message_list is None:
-                        # 缓冲区空了，立即退出循环
+                    # a. 从 CommManager 中非阻塞地拉取下一条消息
+                    message = self.comm_manager.receive_nowait()
+                    if message is None:
+                        # 消息队列空了，结束处理
                         break
-                    for message in message_list:
+
+                    # b. 根据消息类型进行分发
+                    msg_type = message.msg_type
+                    if msg_type == 'async_model_para' or msg_type == 'aggregated_model_para':
+                        # --- 是一个【非加密】的模型消息 ---
                         self.handle_model(message)
-                    break
+                    elif msg_type == 'anonymous_forward':
+                        # --- 是一个【加密】的匿名消息 ---
+                        self.handle_anonymous_message(message)
             elif self.fedspeed_engine.should_aggregate:
                 message = self.comm_manager.receive()
                 self.handle_model(message)
 
-        # 4. 打印日志
+        # 5. 打印日志
         my_rank = dist.get_rank() if dist.is_initialized() else 0
         logger.debug(f"--- Rank {my_rank} | Step {self.current_step} | Loss: {ctx.loss_batch.item():.4f} ---")
 
-        # 5. 更新FederatedScope的统计变量
+        # 6. 更新FederatedScope的统计变量
         ctx.num_samples += ctx.batch_size
         ctx.loss_batch_total += ctx.loss_batch.item() * ctx.batch_size
         ctx.loss_regular_total += float(ctx.get("loss_regular", 0.))
 
-        # 6. 执行评估
+        # 7. 执行评估
         if self.eval_freq > 0 and (self.current_step) % self.eval_freq == 0:
             self.evaluation()
 
+    def _hook_on_fit_end(self, ctx):
+        # --- 首先调用原有的 _hook_on_fit_end ---
+        super()._hook_on_fit_end(ctx)
+        # 在所有训练结束后，安全地停止 Reconstructor 的后台线程
+        if self.fedspeed_engine and self.fedspeed_engine.reconstructor:
+            self.fedspeed_engine.reconstructor.stop()
 
-    def handle_model(self, message):
+    def handle_anonymous_message(self, message: Message):
         """
-        这个方法作为消息处理器，由 Client 的事件循环调用。
+        处理【加密】的匿名消息。
         """
-        logger.info(f"--- [FedSpeed-Model] Aggregating at Step #{self.current_step} ---")
-
-        if self.fedspeed_engine is None: return
+        if not self.router: return
         
-        # 1. 获取一个【模板张量】，以便知道正确的 shape, dtype
-        trainable_params = self.fedspeed_engine.local_optimizer.param_groups[0]['params']
-        template_vec = parameters_to_vector([p.data for p in trainable_params])
+        # 调用 Router 处理
+        result = self.router.handle_anonymous_message(message)
+        if result is None: return
 
-        # 2. 获取原始的数据列表
+        action, data = result
+        if action == 'aggregate':
+            # a. Router 说我是最终目标，直接调用统一的核心处理器
+            decrypted_params_vec = data['content']
+            decrypted_step = data['state']
+            self._handle_incoming_model_vec(decrypted_params_vec.to(self.ctx.device), decrypted_step)
+        elif action == 'forward':
+            # b. Router 说我是中继，需要转发
+            self.comm_manager.send(
+                Message(msg_type='anonymous_forward',
+                        sender=self.client_id,
+                        receiver=data['receiver'],
+                        state=data['state'],
+                        content=data['content'])
+            )
+        else:
+            logger.warning(f"Trainer received an unhandled message type: '{action}'")
+
+    def handle_model(self, message: Message):
+        """
+        处理【非加密】模型消息的公共入口。
+        它的职责是【类型转换】(list -> tensor)，然后调用核心处理器。
+        """
         received_data_list = message.content
         received_step = message.state
 
-        # 3. 使用模板张量的元数据，从列表创建新的张量
+        # 1. 重建张量
         try:
+            trainable_params = self.fedspeed_engine.local_optimizer.param_groups[0]['params']
+            template_vec = parameters_to_vector([p.data for p in trainable_params])
             received_params_vec = torch.tensor(
                 received_data_list, 
-                dtype=template_vec.dtype # 确保数据类型一致
+                dtype=template_vec.dtype
             ).to(self.ctx.device)
-            
-            # d. 验证形状是否一致
+
+            # 验证形状是否一致
             if received_params_vec.shape != template_vec.shape:
                 logger.warning(f"Shape mismatch in received async model. "
                             f"Expected {template_vec.shape}, but got {received_params_vec.shape}. "
                             "Aggregation might be incorrect.")
-
         except Exception as e:
             logger.error(f"Failed to convert received list to tensor: {e}", exc_info=True)
             return
             
+        # 2. 调用统一的核心处理器
+        self._handle_incoming_model_vec(received_params_vec, received_step)
+
+    def _handle_incoming_model_vec(self, received_params_vec: torch.Tensor, received_step: int):
+        """
+        一个统一的、私有的核心处理器，接收一个【torch.Tensor】和一个 step，然后执行聚合。
+        """
+        if not (hasattr(self, 'fedspeed_engine') and self.fedspeed_engine):
+            return
+        logger.info(f"--- [FedSpeed-Model] Aggregating at Step #{self.current_step} ---")
+            
+        # 异步模式下，计算自适应权重
         if self.asynchronous:
-            if self.adaptive_weight_cfg['use']:
+            alpha_for_this_aggregation = 0.5
+            if self.adaptive_weight_cfg.get('use', False):
                 alpha_for_this_aggregation = self._calculate_adaptive_alpha(received_step)
-                logger.debug(f"alpha_for_this_aggregation: {alpha_for_this_aggregation}")
-            if hasattr(self, 'fedspeed_engine') and self.fedspeed_engine:
-                # 调用 Engine 的聚合方法，这个方法内部需要加锁
-                self.fedspeed_engine.aggregate_model(received_params_vec, alpha_for_this_aggregation)
-        else:
+            
+            # 调用 Engine 的异步聚合方法
+            self.fedspeed_engine.aggregate_model(
+                received_params_vec, 
+                alpha_for_this_aggregation
+            )
+        else: # 同步模式
+            # 调用 Engine 的同步更新方法
             self.fedspeed_engine.update_model(received_params_vec)
+
+    def _calculate_adaptive_alpha(self, received_step):
+        """一个辅助函数，用于计算自适应的聚合权重。"""
+        initial_alpha = 0.5
+        staleness = (self.current_step - received_step) / self.aggregation_steps
+        logger.debug(f"staleness: {staleness}")
+        # 如果消息来自未来，则不认为是陈旧的
+        if staleness < 0: 
+            return initial_alpha
+            
+        func_type = self.adaptive_weight_cfg.get('type', 'constant')
+        if func_type == 'exponential':
+            decay_rate = self.adaptive_weight_cfg.get('decay_rate', 0.9)
+            return initial_alpha * (decay_rate ** staleness)
+        elif func_type == 'linear':
+            decay_factor = self.adaptive_weight_cfg.get('decay_factor', 0.01)
+            return max(0.0, initial_alpha - staleness * decay_factor)
+        # ... (可以扩展其他函数)
+        else: # 'constant'
+            return initial_alpha
 
     def evaluation(self):
         """
@@ -391,12 +473,16 @@ class FedSpeedTrainer(LLMTrainer):
         if is_training_mode:
             self.ctx.model.train()
 
-    def _hook_on_fit_end(self, ctx):
-        # --- 首先调用原有的 _hook_on_fit_end ---
-        super()._hook_on_fit_end(ctx)
-        # 在所有训练结束后，安全地停止 Reconstructor 的后台线程
-        if self.fedspeed_engine and self.fedspeed_engine.reconstructor:
-            self.fedspeed_engine.reconstructor.stop()
+    def initialize_router(self, client_id, peers):
+        """
+        一个由 Client 调用的、专门用于初始化 Router 的方法。
+        """
+        if self.anonymous_routing and self.router is None:
+             logger.info(f"Client #{client_id}: Initializing AnonymousRouter.")
+             self.router = AnonymousRouter(
+                 client_id=client_id,
+                 cfg=self.cfg
+             )
 
 def apply_checkpointing(model, block_class, engine):
     """
@@ -418,7 +504,7 @@ def apply_checkpointing(model, block_class, engine):
 
                 # 定义在 recomputation 期间要执行的函数
                 def recompute_function(*args, **kwargs):
-                    # 【核心】在重新计算前，设置标志位
+                    # 在重新计算前，设置标志位
                     engine.is_recomputing = True
                     try:
                         result = m.original_forward(*args, **kwargs)

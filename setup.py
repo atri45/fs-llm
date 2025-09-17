@@ -56,7 +56,8 @@ llm_requires = [
     'accelerate==0.20.3',
     'peft==0.3.0',
     'sentencepiece==0.1.99',
-    'deepspeed'
+    'deepspeed',
+    'cryptography'
 ]
 
 benchmark_hpo_requires = [

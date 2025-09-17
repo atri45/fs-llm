@@ -1,3 +1,4 @@
+import queue
 import threading
 
 from federatedscope.core.message import Message
@@ -47,9 +48,31 @@ class gRPCComServeFunc(gRPC_comm_manager_pb2_grpc.gRPCComServeFuncServicer):
         with self.lock:
             if not self.latest_msg_from_sender:
                 return None
-            
-            # 将当前的所有最新消息打包成一个列表返回
-            received_requests = list(self.latest_msg_from_sender.values())
-            self.latest_msg_from_sender.clear()
+            sender_id, received_request = self.latest_msg_from_sender.popitem()
         
-        return received_requests
+        return received_request
+            
+class anonymous_gRPCComServeFunc(gRPC_comm_manager_pb2_grpc.gRPCComServeFuncServicer):
+    def __init__(self):
+        # 使用线程安全的 Queue，它可以保存多个消息
+        self.msg_queue = queue.Queue()
+
+    def sendMessage(self, request, context):
+        """ 由 gRPC I/O 线程调用，将消息放入队列。"""
+        self.msg_queue.put(request)
+        return gRPC_comm_manager_pb2.MessageResponse(msg='ACK')
+
+    def receive(self):
+        """ 这是一个高效的阻塞式接收。"""
+        received_msg = self.msg_queue.get()
+        return received_msg
+
+    def receive_nowait(self):
+        """ 这是一个高效的非阻塞式接收。"""
+        if self.msg_queue.empty():
+            return None
+        else:
+            try:
+                return self.msg_queue.get_nowait()
+            except queue.Empty:
+                return None

@@ -17,6 +17,7 @@ from federatedscope.llm.trainer.fedspeed_trainer import FedSpeedTrainer, EarlySt
 from torch.nn.utils.convert_parameters import vector_to_parameters
 from collections import OrderedDict
 from federatedscope.core.communication import gRPCCommManager
+from cryptography.hazmat.primitives import serialization
 
 logger = logging.getLogger(__name__)
 
@@ -95,12 +96,15 @@ class FedSpeedServer(Server):
         self.coordinator_engine = None
         self.final_shards_buffer = {}
         self.asynchronous = self._cfg.federate.get('asynchronous_aggregation', False)
-
+        self.anonymous_routing = self._cfg.federate.get('anonymous_routing', False)
+            
         self.register_handlers('fedspeed_ready', self.callback_funcs_for_fedspeed_ready)
         if self.asynchronous == False:
             #  为同步聚合准备缓冲区
             self.sync_model_buffer = {}
             self.register_handlers('sync_model_para', self.callback_funcs_for_sync_model_para)
+        if self.anonymous_routing:
+            self.public_key_buffer = {}
 
     def trigger_for_start(self):
         if self.check_client_join_in():
@@ -114,12 +118,11 @@ class FedSpeedServer(Server):
                 super().trigger_for_start()
     
     def fedspeed_setup(self):
-        # 把之前设计的 fedspeed_setup 逻辑完整地搬到这里
         participants = list(self.comm_manager.neighbors.keys())
         self.world_size = len(participants)
         self.fedspeed_participants = sorted(list(self.comm_manager.neighbors.keys()))
 
-        if self.world_size < 2: # FedSpeed 至少需要2个参与方
+        if self.world_size < 2: # 至少需要2个参与方
             logger.error(f"FedSpeed requires at least 2 clients, but only {self.world_size} joined.")
             self.terminate()
             return
@@ -148,36 +151,48 @@ class FedSpeedServer(Server):
 
     def callback_funcs_for_fedspeed_ready(self, message: Message):
         """
-        当所有客户端准备好后，在服务器端进行分片和演练，然后分发初始化包。
+        当所有客户端准备好后，进行密钥交换和分发初始化包。
         """
         self.fedspeed_ready_client_count += 1
         logger.info(f"FedSpeed: Received 'ready' from Client #{message.sender}. ({self.fedspeed_ready_client_count}/{len(self.fedspeed_participants)})")
+        if self.anonymous_routing:
+            sender_id = message.sender
+            # content 现在是 PEM 格式的字节串，可以直接存储
+            public_key_b64_str = message.content
+            self.public_key_buffer[sender_id] = public_key_b64_str
         
         if self.fedspeed_ready_client_count == len(self.fedspeed_participants):
-            logger.info("All clients are ready! Server is now profiling and sharding the model...")
+            logger.info("All clients are ready! Server is now preparing initialization packages...")
+            self.start_training_package_distribution()
 
-            # 1. 创建并运行协调引擎
-            self.coordinator_engine = FedSpeedCoordinatorEngine(self.model, self._cfg, self.world_size)
-            all_client_packages = self.coordinator_engine.profile_and_shard()
-            self.coordinator_engine = None
+    def start_training_package_distribution(self):
+        """
+        在服务器端进行分片和演练，然后分发初始化包。
+        """
+        # 1. 创建并运行协调引擎
+        self.coordinator_engine = FedSpeedCoordinatorEngine(self.model, self._cfg, self.world_size)
+        all_client_packages = self.coordinator_engine.profile_and_shard()
+        self.coordinator_engine = None
 
-            # 2. 向每个客户端发送其专属的初始化包
-            for i, client_id in enumerate(self.fedspeed_participants):
-                package_to_send = all_client_packages[i]
-                address_book = self.comm_manager.get_neighbors()
-                package_to_send['address_book'] = address_book
+        # 2. 向每个客户端发送其专属的初始化包
+        for i, client_id in enumerate(self.fedspeed_participants):
+            package_to_send = all_client_packages[i]
+            address_book = self.comm_manager.get_neighbors()
+            package_to_send['address_book'] = address_book
+            if self.anonymous_routing:
+                package_to_send['public_key_book'] = self.public_key_buffer
 
-                # 序列化并发送
-                content = base64.b64encode(pickle.dumps(package_to_send)).decode('ascii')
-                
-                self.comm_manager.send(
-                    Message(msg_type='fedspeed_init_package',
-                            sender=self.ID,
-                            receiver=[client_id],
-                            state=self.state,
-                            content=content)
-                )
-            logger.info("All initialization packages have been sent to clients. Start training……")
+            # 序列化并发送
+            content = base64.b64encode(pickle.dumps(package_to_send)).decode('ascii')
+            
+            self.comm_manager.send(
+                Message(msg_type='fedspeed_init_package',
+                        sender=self.ID,
+                        receiver=[client_id],
+                        state=self.state,
+                        content=content)
+            )
+        logger.info("All initialization packages have been sent to clients. Start training……")
 
     def callback_funcs_for_sync_model_para(self, message: Message):
         """
@@ -234,11 +249,16 @@ class FedSpeedClient(Client):
         self.dist_group_initialized = False
         self.monitor = PerformanceMonitor(self.device)
         self.asynchronous = self._cfg.federate.get('asynchronous_aggregation', False)
+        self.anonymous_routing = self._cfg.federate.get('anonymous_routing', False)
 
         self.register_handlers('fedspeed_setup', self.callback_funcs_for_fedspeed_setup)
         self.register_handlers('fedspeed_init_package', self.callback_funcs_for_init_package)
         if self.asynchronous:
-            self.register_handlers('async_model_para', self.trainer.handle_model)
+            if self.anonymous_routing:
+                # 在匿名路由模式下，处理器是不同的
+                self.register_handlers('anonymous_forward', self.trainer.handle_anonymous_message)
+            else:
+                self.register_handlers('async_model_para', self.trainer.handle_model)
         else :
             self.register_handlers('aggregated_model_para', self.trainer.handle_model)
 
@@ -248,7 +268,6 @@ class FedSpeedClient(Client):
             # 销毁已经存在的默认通信组
             dist.destroy_process_group()
 
-        # 把之前设计的客户端建组逻辑完整地搬到这里
         if self.dist_group_initialized:
             logger.warning(f"Client #{self.ID} received fedspeed_setup, but already initialized.")
             return
@@ -268,6 +287,37 @@ class FedSpeedClient(Client):
             )
             self.dist_group_initialized = True
             logger.info(f"Client #{self.ID} (Rank {config['rank']}) successfully joined group.")
+
+            # 如果需要匿名路由，则立即初始化 Router 并发送公钥
+            public_key_pem_bytes = None
+            if self.anonymous_routing:
+                 # a. 确保 Trainer 存在
+                if not isinstance(self.trainer, FedSpeedTrainer): 
+                    raise TypeError(f"FedSpeedClient is not configured with FedSpeedTrainer.")
+                
+                # b. 手动触发 Trainer 的 Router 初始化
+                self.trainer.initialize_router(self.ID, self.comm_manager)
+                
+                # c. 发送公钥
+                if hasattr(self.trainer, 'router') and self.trainer.router:
+                    logger.info(f"Client #{self.ID}: Sending public key to server.")
+                    public_key_pem_bytes = self.trainer.router.public_key.public_bytes(
+                        encoding=serialization.Encoding.PEM,
+                        format=serialization.PublicFormat.SubjectPublicKeyInfo
+                    )
+                # 将 PEM 字节串编码为 Base64 字符串
+                public_key_b64_str = base64.b64encode(public_key_pem_bytes).decode('ascii')
+
+                self.comm_manager.send(
+                    Message(msg_type='fedspeed_ready',
+                        sender=self.ID,
+                        receiver=[self.server_id],
+                        state=self.state,
+                        content=public_key_b64_str)
+                )
+                return
+
+            # 发送 ready 信号
             self.comm_manager.send(
                 Message(msg_type='fedspeed_ready',
                         sender=self.ID,
@@ -305,7 +355,34 @@ class FedSpeedClient(Client):
             peers = [cid for cid in all_neighbors if cid != self.ID and cid != 0]
             self.trainer.peers = peers
 
-            # 3 现在可以安全地开始训练了
+            # 3. 配置公钥通讯录
+            if self.anonymous_routing:
+                public_key_book_serialized = init_package.get('public_key_book')
+                if hasattr(self.trainer, 'router') and self.trainer.router and public_key_book_serialized:
+                    # 遍历收到的序列化公钥
+                    for client_id, key_b64_str in public_key_book_serialized.items():
+                        if client_id == self.ID: continue
+                        try:
+                            # 将 Base64 字符串解码回 PEM 字节串
+                            key_pem_bytes = base64.b64decode(key_b64_str)
+                            
+                            # 使用字节串反序列化为对象
+                            public_key_obj = serialization.load_pem_public_key(
+                                key_pem_bytes
+                            )
+                            # 存入 Router
+                            self.trainer.router.public_keys[client_id] = public_key_obj
+                        except Exception as e:
+                            logger.error(f"Failed to deserialize public key for Client #{client_id}: {e}")
+                    # Router 现在拥有了所有 peers 的公钥
+                    # 它也需要知道 peers 的 ID
+                    self.trainer.router.peers = self.trainer.peers
+                    self.trainer.router.all_client_ids = [self.trainer.client_id] + self.trainer.peers
+                    logger.info(f"Client #{self.ID}: Public key book received and configured.")
+                else:
+                    raise RuntimeError("Anonymous routing enabled, but public key book not received or router not initialized.")
+
+            # 4. 现在可以安全地开始训练了
             self.monitor.start()
             logger.info("All setup complete. Starting FedSpeed training...")
             self.trainer.train()

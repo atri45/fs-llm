@@ -7,7 +7,7 @@ from collections import deque
 
 from federatedscope.core.proto import gRPC_comm_manager_pb2, \
     gRPC_comm_manager_pb2_grpc
-from federatedscope.core.gRPC_server import gRPCComServeFunc
+from federatedscope.core.gRPC_server import gRPCComServeFunc, anonymous_gRPCComServeFunc
 from federatedscope.core.message import Message
 
 logger = logging.getLogger(__name__)
@@ -109,20 +109,24 @@ class gRPCCommManager(object):
         self.host = host
         self.port = port
         options = [
-            ("grpc.max_send_message_length", cfg.grpc_max_send_message_length),
+            ("grpc.max_send_message_length", cfg.distribute.grpc_max_send_message_length),
             ("grpc.max_receive_message_length",
-             cfg.grpc_max_receive_message_length),
-            ("grpc.enable_http_proxy", cfg.grpc_enable_http_proxy),
+             cfg.distribute.grpc_max_receive_message_length),
+            ("grpc.enable_http_proxy", cfg.distribute.grpc_enable_http_proxy),
         ]
 
-        if cfg.grpc_compression.lower() == 'deflate':
+        if cfg.distribute.grpc_compression.lower() == 'deflate':
             self.comp_method = grpc.Compression.Deflate
-        elif cfg.grpc_compression.lower() == 'gzip':
+        elif cfg.distribute.grpc_compression.lower() == 'gzip':
             self.comp_method = grpc.Compression.Gzip
         else:
             self.comp_method = grpc.Compression.NoCompression
 
-        self.server_funcs = gRPCComServeFunc()
+        if cfg.federate.anonymous_routing:
+            logger.info("use anonymous_gRPCComServeFunc!")
+            self.server_funcs = anonymous_gRPCComServeFunc()
+        else:
+            self.server_funcs = gRPCComServeFunc()
         self.grpc_server = self.serve(max_workers=client_num,
                                       host=host,
                                       port=port,
@@ -212,19 +216,9 @@ class gRPCCommManager(object):
         return message
 
     def receive_nowait(self):
-        """
-        对外暴露非阻塞的 receive 接口，返回一个列表。
-        """
-        # 1. 从底层服务获取消息【列表】
-        received_requests = self.server_funcs.receive_nowait()
-        if received_requests is None:
+        received_msg = self.server_funcs.receive_nowait()
+        if received_msg is None:
             return None
-
-        # 2. 将 Protobuf 请求列表，转换为 Message 对象列表
-        message_list = []
-        for request in received_requests:
-            message = Message()
-            message.parse(request.msg)
-            message_list.append(message)
-            
-        return message_list
+        message = Message()
+        message.parse(received_msg.msg)
+        return message

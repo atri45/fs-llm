@@ -5,10 +5,11 @@ federate:
   method: fedspeed
   aggregation_mode: 'local-reconstruct'
   asynchronous_aggregation: True
+  anonymous_routing: False
   use_activation_checkpointing: True
   use_offline_model: True
   mode: distributed
-  client_num: 2
+  client_num: 4
   save_to: "gpt2_alpaca.ckpt"
 data:
   root: data/

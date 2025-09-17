@@ -220,7 +220,7 @@ class Server(BaseServer):
             self.comm_manager = gRPCCommManager(host=host,
                                                 port=port,
                                                 client_num=client_num,
-                                                cfg=self._cfg.distribute)
+                                                cfg=self._cfg)
             logger.info('Server: Listen to {}:{}...'.format(host, port))
 
         # inject noise before broadcast

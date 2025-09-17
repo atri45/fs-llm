@@ -38,6 +38,7 @@ def extend_fl_setting_cfg(cfg):
     cfg.federate.aggregation_mode= 'gradient'
     cfg.federate.aggregation_steps= 20
     cfg.federate.asynchronous_aggregation = False
+    cfg.federate.anonymous_routing = False
     cfg.federate.model_cache_path='./model_cache/'
     cfg.federate.use_offline_model= False
     cfg.federate.gpu_mem_pressure_threshold= 0.9
