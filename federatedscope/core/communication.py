@@ -1,3 +1,4 @@
+import threading
 import grpc
 from concurrent import futures
 import logging
@@ -108,10 +109,9 @@ class gRPCCommManager(object):
     def __init__(self, host='0.0.0.0', port='50050', client_num=2, cfg=None):
         self.host = host
         self.port = port
-        options = [
+        self.channel_options = [
             ("grpc.max_send_message_length", cfg.distribute.grpc_max_send_message_length),
-            ("grpc.max_receive_message_length",
-             cfg.distribute.grpc_max_receive_message_length),
+            ("grpc.max_receive_message_length", cfg.distribute.grpc_max_receive_message_length),
             ("grpc.enable_http_proxy", cfg.distribute.grpc_enable_http_proxy),
         ]
 
@@ -123,15 +123,16 @@ class gRPCCommManager(object):
             self.comp_method = grpc.Compression.NoCompression
 
         if cfg.federate.anonymous_routing:
-            logger.info("use anonymous_gRPCComServeFunc!")
             self.server_funcs = anonymous_gRPCComServeFunc()
         else:
             self.server_funcs = gRPCComServeFunc()
         self.grpc_server = self.serve(max_workers=client_num,
                                       host=host,
                                       port=port,
-                                      options=options)
-        self.neighbors = dict()
+                                      options=self.channel_options)
+        self.neighbors = {} # 只存储地址
+        self.stubs = {}     # 缓存已建立的连接 (stub)
+        self.lock = threading.Lock() # 用于保护 stubs 字典的线程安全
         self.monitor = None  # used to track the communication related metrics
 
     def serve(self, max_workers, host, port, options):
@@ -152,13 +153,12 @@ class gRPCCommManager(object):
 
     def add_neighbors(self, neighbor_id, address):
         if isinstance(address, dict):
-            self.neighbors[neighbor_id] = '{}:{}'.format(
-                address['host'], address['port'])
+            self.neighbors[neighbor_id] = '{}:{}'.format(address['host'], address['port'])
         elif isinstance(address, str):
             self.neighbors[neighbor_id] = address
         else:
-            raise TypeError(f"The type of address ({type(address)}) is not "
-                            "supported yet")
+            raise TypeError(...)
+        logger.info(f"Neighbor #{neighbor_id} at {self.neighbors[neighbor_id]} has been registered.")
 
     def get_neighbors(self, neighbor_id=None):
         address = dict()
@@ -173,41 +173,75 @@ class gRPCCommManager(object):
             # Get all neighbors
             return self.neighbors
 
-    def _send(self, receiver_address, message):
-        def _create_stub(receiver_address):
-            """
-            This part is referred to
-            https://grpc.io/docs/languages/python/basics/#creating-a-stub
-            """
-            channel = grpc.insecure_channel(receiver_address,
-                                            compression=self.comp_method,
-                                            options=(('grpc.enable_http_proxy',
-                                                      0), ))
-            stub = gRPC_comm_manager_pb2_grpc.gRPCComServeFuncStub(channel)
-            return stub, channel
+    def get_stub(self, receiver_id):
+        """
+        懒加载获取到某个接收者的 Stub。
+        如果连接已缓存，直接返回；否则，创建、缓存并返回。
+        """
+        # 先在无锁情况下快速检查，提高性能
+        if receiver_id in self.stubs:
+            return self.stubs[receiver_id]
 
-        stub, channel = _create_stub(receiver_address)
+        # 如果未找到，进入线程安全的创建流程
+        with self.lock:
+            # 再次检查，防止在等待锁的过程中其他线程已经创建了它
+            if receiver_id in self.stubs:
+                return self.stubs[receiver_id]
+
+            receiver_address = self.neighbors.get(receiver_id)
+            if not receiver_address:
+                logger.warning(f"Address for neighbor #{receiver_id} not found.")
+                return None
+
+            # 创建长连接 Channel
+            channel = grpc.insecure_channel(
+                receiver_address,
+                compression=self.comp_method,
+                options=self.channel_options
+            )
+            
+            # 创建 Stub 并缓存
+            stub = gRPC_comm_manager_pb2_grpc.gRPCComServeFuncStub(channel)
+            self.stubs[receiver_id] = stub
+            logger.info(f"Lazily established a persistent gRPC connection to neighbor #{receiver_id} at {receiver_address}")
+            return stub
+
+    def _send(self, receiver_id, message, blocking=False):
+        """
+        使用 get_stub 获取连接，然后发送。
+        """
+        stub = self.get_stub(receiver_id)
+        if stub is None:
+            return
+
         request = message.transform(to_list=True)
+
         try:
-            stub.sendMessage(request)
-        except grpc._channel._InactiveRpcError as error:
-            logger.warning(error)
-            pass
-        channel.close()
+            future = stub.sendMessage.future(request, timeout=15.0)
+        
+            if blocking:
+                # 如果是阻塞模式，则等待 RPC 完成
+                future.result() # 这会阻塞直到收到服务器的 ACK
+                
+        except grpc.RpcError as error:
+            logger.error(f"gRPC call to #{receiver_id} failed with unrecoverable error: {error}")
 
     def send(self, message):
+        # --- 检查消息类型，决定是否阻塞 ---
+        blocking_msg_types = ['join_in', 'fedspeed_setup', 'fedspeed_init_package', 'fedspeed_ready', 'early_stop_vote' ,'sync_model_para', 'aggregated_model_para']
+        is_blocking = message.msg_type in blocking_msg_types
+
         receiver = message.receiver
         if receiver is not None:
             if not isinstance(receiver, list):
                 receiver = [receiver]
-            for each_receiver in receiver:
-                if each_receiver in self.neighbors:
-                    receiver_address = self.neighbors[each_receiver]
-                    self._send(receiver_address, message)
+            for each_receiver_id in receiver:
+                if each_receiver_id in self.neighbors:
+                    self._send(each_receiver_id, message, blocking=is_blocking)
         else:
-            for each_receiver in self.neighbors:
-                receiver_address = self.neighbors[each_receiver]
-                self._send(receiver_address, message)
+            # 广播给所有邻居
+            for each_receiver_id in self.neighbors:
+                self._send(each_receiver_id, message, blocking=is_blocking)
 
     def receive(self):
         received_msg = self.server_funcs.receive()
@@ -222,3 +256,10 @@ class gRPCCommManager(object):
         message = Message()
         message.parse(received_msg.msg)
         return message
+    
+    def stop(self):
+        """
+        在程序结束时，优雅地关闭服务器。
+        """
+        logger.info("Stopping gRPC server...")
+        self.grpc_server.stop(grace=1.0)

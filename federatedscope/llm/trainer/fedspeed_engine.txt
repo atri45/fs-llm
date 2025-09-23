@@ -106,7 +106,7 @@ class FedSpeedEngine:
 
     def _initialize_optimizer(self):
         """
-        【重构】根据 aggregation_mode 初始化相应的优化器和参数缓冲区。
+        根据 aggregation_mode 初始化相应的优化器和参数缓冲区。
         """        
         # --- 根据模式进行不同的初始化 ---
         if self.aggregation_mode == 'gradient':
@@ -384,7 +384,7 @@ class FedSpeedEngine:
 
     def step(self, flat_grad_shard: torch.Tensor = None):
         """
-        【重构】根据 self.aggregation_mode 选择不同的更新路径。
+        根据 self.aggregation_mode 选择不同的更新路径。
         注意：当模式为 'model' 时，传入的 flat_grad_shard 将被忽略。
         """
         if self.aggregation_mode == 'gradient':

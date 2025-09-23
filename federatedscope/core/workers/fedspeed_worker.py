@@ -1,3 +1,4 @@
+import shutil
 import time
 import torch
 import psutil
@@ -95,9 +96,15 @@ class FedSpeedServer(Server):
         self.fedspeed_participants = []
         self.coordinator_engine = None
         self.final_shards_buffer = {}
+        self.rank_to_client_id_map = {}
+        
         self.asynchronous = self._cfg.federate.get('asynchronous_aggregation', False)
         self.anonymous_routing = self._cfg.federate.get('anonymous_routing', False)
-            
+        if self._cfg.federate.aggregation_mode == 'shardedGradient':
+            self.anonymous_routing = True
+        if self._cfg.federate.aggregation_mode == 'fl-sim':
+            self.asynchronous = False
+
         self.register_handlers('fedspeed_ready', self.callback_funcs_for_fedspeed_ready)
         if self.asynchronous == False:
             #  为同步聚合准备缓冲区
@@ -127,6 +134,7 @@ class FedSpeedServer(Server):
             self.terminate()
             return
 
+        self.rank_to_client_id_map = {i: client_id for i, client_id in enumerate(self.fedspeed_participants)}
         master_addr = self._cfg.distribute.server_host
         master_port = self._cfg.distribute.server_port + 100
         
@@ -138,7 +146,8 @@ class FedSpeedServer(Server):
                 'master_addr': master_addr,
                 'master_port': master_port,
                 'world_size': self.world_size,
-                'rank': rank
+                'rank': rank,
+                'client_id': client_id
             }
             
             self.comm_manager.send(
@@ -177,6 +186,7 @@ class FedSpeedServer(Server):
         # 2. 向每个客户端发送其专属的初始化包
         for i, client_id in enumerate(self.fedspeed_participants):
             package_to_send = all_client_packages[i]
+            package_to_send['rank_to_client_id_map'] = self.rank_to_client_id_map
             address_book = self.comm_manager.get_neighbors()
             package_to_send['address_book'] = address_book
             if self.anonymous_routing:
@@ -200,8 +210,17 @@ class FedSpeedServer(Server):
         """
         sender_id = message.sender
         current_step = message.state
-        params_vec = message.content
+        content = message.content
         
+        # bytes 转为 tensor
+        try:
+            pickled_bytes = base64.b64decode(content.encode('ascii'))
+            # unpickle 后的对象是 CPU Tensor，需要转为 numpy
+            params_vec = pickle.loads(pickled_bytes).numpy()
+        except Exception as e:
+            logger.error(f"Failed to deserialize b64_pickled_tensor from client #{sender_id}: {e}")
+            return
+
         # 将收到的模型存入当前 step 的缓冲区
         if current_step not in self.sync_model_buffer:
             self.sync_model_buffer[current_step] = {}
@@ -223,13 +242,18 @@ class FedSpeedServer(Server):
                 # 调用 .mean(axis=0) 高效地计算平均值
                 aggregated_numpy_array = numpy_array_2d.mean(axis=0)
             
+                # 将 numpy array 转为 CPU Tensor
+                agg_tensor = torch.from_numpy(aggregated_numpy_array)
+                pickled_bytes = pickle.dumps(agg_tensor)
+                content_to_broadcast = base64.b64encode(pickled_bytes).decode('ascii')
+
                 # 将聚合后的新模型广播给所有客户端
                 self.comm_manager.send(
                     Message(msg_type='aggregated_model_para',
                             sender=self.ID,
                             receiver=list(self.comm_manager.neighbors.keys()),
                             state=current_step,
-                            content=aggregated_numpy_array)
+                            content=content_to_broadcast)
                 )
             
             except Exception as e:
@@ -250,16 +274,31 @@ class FedSpeedClient(Client):
         self.monitor = PerformanceMonitor(self.device)
         self.asynchronous = self._cfg.federate.get('asynchronous_aggregation', False)
         self.anonymous_routing = self._cfg.federate.get('anonymous_routing', False)
-
+        self.is_decentralized_sharded_mode = self._cfg.federate.aggregation_mode == 'shardedGradient'
+        if self.is_decentralized_sharded_mode:
+            self.anonymous_routing = True
+        if self._cfg.federate.aggregation_mode == 'fl-sim':
+            self.asynchronous = False
+        
         self.register_handlers('fedspeed_setup', self.callback_funcs_for_fedspeed_setup)
         self.register_handlers('fedspeed_init_package', self.callback_funcs_for_init_package)
+
         if self.asynchronous:
-            if self.anonymous_routing:
-                # 在匿名路由模式下，处理器是不同的
-                self.register_handlers('anonymous_forward', self.trainer.handle_anonymous_message)
+            # 所有异步模式都需要处理独立的投票消息
+            self.register_handlers('early_stop_vote', self.trainer.passive_receive_message)
+
+            # 分模式注册数据消息处理器
+            if self.is_decentralized_sharded_mode:
+                self.register_handlers('anonymous_forward', self.trainer.passive_receive_message)
+                self.register_handlers('parameter_shard_update', self.trainer.passive_receive_message)
             else:
-                self.register_handlers('async_model_para', self.trainer.handle_model)
-        else :
+                # 其他异步模式（如 'model', 'local-reconstruct' 等）的消息处理器
+                self.register_handlers('async_model_para', self.trainer.passive_receive_message)
+                # 如果也支持匿名路由，则添加
+                if self.anonymous_routing:
+                    self.register_handlers('anonymous_forward', self.trainer.passive_receive_message)
+        else:
+            # 同步模式的处理器
             self.register_handlers('aggregated_model_para', self.trainer.handle_model)
 
     def callback_funcs_for_fedspeed_setup(self, message: Message):
@@ -274,6 +313,10 @@ class FedSpeedClient(Client):
 
         config = message.content
         self.my_rank = config['rank']
+
+        if 'client_id' in config:
+            self.ID = config['client_id']
+            logger.info(f"Client ID has been set to #{self.ID}.")
 
         # ... (完整的 init_process_group 逻辑) ...
         try:
@@ -337,6 +380,7 @@ class FedSpeedClient(Client):
         try:
             # 1. 初始化 Trainer 和 Engine
             init_package = pickle.loads(base64.b64decode(message.content))
+
             if not isinstance(self.trainer, FedSpeedTrainer):
                 raise TypeError(f"FedSpeedClient is not configured with FedSpeedTrainer.")
             self.trainer.fedspeed_init_package = init_package
@@ -395,9 +439,10 @@ class FedSpeedClient(Client):
             # 这确保了即使训练中途出错，也能保存当时的模型状态
             logger.info("Training finished or interrupted.")
             self.monitor.stop()
-            if self.trainer.early_stopper and self.trainer.early_stopper.early_stop:
-                self.trainer.early_stopper.load_best_checkpoint(self.trainer.fedspeed_engine)
+            # if self.trainer.early_stopper and self.trainer.early_stopper.early_stop:
+            #     self.trainer.early_stopper.load_best_checkpoint(self.trainer.fedspeed_engine)
             self.save_final_model_locally()
+            self.comm_manager.stop()
 
     def save_final_model_locally(self):
         """
@@ -408,39 +453,30 @@ class FedSpeedClient(Client):
             return
 
         engine = self.trainer.fedspeed_engine
-
-        # --- 两种模式的处理方式 ---
-        final_state_dict_to_save = OrderedDict()
-
-        with torch.no_grad():
-            if engine.aggregation_mode == 'model' or engine.aggregation_mode == 'local-reconstruct':
-                # 在这些模式下，有完整的 FP32 主权重或完整的本地优化器
-                if engine.local_optimizer:
-                    # 从优化器管理的参数中获取【最终状态】
-                    # 这些参数可能是聚合后的，也可能是纯本地训练的，取决于聚合频率
-                    trainable_params = engine.local_optimizer.param_groups[0]['params']
-                    # 将它们打包成一个 state_dict
-                    for i, name in enumerate(engine.ordered_trainable_names):
-                        # 确保保存为 CPU 张量
-                        final_state_dict_to_save[name] = trainable_params[i].data.cpu().clone()
-                else:
-                     logger.warning("Local optimizer not found in 'model' mode. Cannot save model.")
-                     return
-
-        # --- 文件保存逻辑 ---
-        if not final_state_dict_to_save:
-            logger.error("Failed to construct the final state_dict. Model not saved.")
+        # 获取 EarlyStopper 保存的临时检查点文件路径
+        best_model_checkpoint_path = self.trainer.early_stopper.checkpoint_path
+        
+        if not os.path.exists(best_model_checkpoint_path):
+            logger.error(f"Best model checkpoint file not found at '{best_model_checkpoint_path}'. Cannot save final model.")
             return
-            
+
+        # --- 最终文件保存的目标路径 (与你之前的逻辑一致) ---
         save_dir = self._cfg.federate.get('client_save_path', './fedspeed_final_models/')
         os.makedirs(save_dir, exist_ok=True)
         
-        # 构造一个每个客户端独有的文件名
-        # "gpt2_lora_final.ckpt" -> "client_1_gpt2_lora_final.ckpt"
         base_filename = self._cfg.federate.save_to
         final_filename = f"client_{self.ID}_{base_filename}"
-        save_path = os.path.join(save_dir, final_filename)
-        
-        # 保存
-        torch.save(final_state_dict_to_save, save_path)
-        logger.info(f"Client #{self.ID}: Best eval loss： {self.trainer.early_stopper.best_score}. Final trainable parameters saved to {save_path}")
+        final_save_path = os.path.join(save_dir, final_filename)
+
+        try:
+            # 使用 shutil.move 来重命名并移动文件，更高效
+            shutil.move(best_model_checkpoint_path, final_save_path)
+            
+            best_score_info = ""
+            if self.trainer.early_stopper.best_score is not None:
+                best_score_info = f"Best eval loss: {self.trainer.early_stopper.best_score:.4f}. "
+            
+            logger.info(f"Client #{self.ID} (Rank 0): {best_score_info}Final best model saved to '{final_save_path}'")
+
+        except Exception as e:
+            logger.error(f"Failed to move best model checkpoint from '{best_model_checkpoint_path}' to '{final_save_path}': {e}")  

@@ -4,8 +4,8 @@ early_stop:
   patience: 3
 federate:
   method: fedspeed
-  aggregation_mode: 'local-reconstruct'
-  aggregation_steps: 40
+  aggregation_mode: 'shardedGradient'
+  aggregation_steps: 20
   asynchronous_aggregation: True
   anonymous_routing: False
   use_activation_checkpointing: True
@@ -24,7 +24,7 @@ federate:
     use: True
     type: 'exponential'
     decay_rate: 0.9
-  gossip_num: 2
+  gossip_num: -1
 data:
   root: data/
   type: 'alpaca@llm'
@@ -72,6 +72,6 @@ criterion:
 trainer:
   type: fedspeedtrainer
 eval:
-  freq: 80
+  freq: 40
   metrics: ['loss']
   count_flops: False

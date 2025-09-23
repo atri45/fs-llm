@@ -1,10 +1,12 @@
 import queue
 import threading
+import logging
 
 from federatedscope.core.message import Message
 from federatedscope.core.proto import gRPC_comm_manager_pb2, \
     gRPC_comm_manager_pb2_grpc
 
+logger = logging.getLogger(__name__)
 
 class gRPCComServeFunc(gRPC_comm_manager_pb2_grpc.gRPCComServeFuncServicer):
     def __init__(self):

@@ -3,7 +3,8 @@ early_stop:
   patience: 3
 federate:
   method: fedspeed
-  aggregation_mode: 'local-reconstruct'
+  aggregation_mode: 'shardedGradient'
+  aggregation_steps: 20
   asynchronous_aggregation: True
   anonymous_routing: False
   use_activation_checkpointing: True
