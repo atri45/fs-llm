@@ -50,7 +50,42 @@ def get_splitter(config):
             return splitter
     # Delay import
     # generic splitter
-    if config.data.splitter == 'lda':
+    if config.data.splitter == 'grouped':
+        print("\n" + "="*20 + " Building GroupedSplitter " + "="*20)
+        from federatedscope.core.splitters.generic.grouped_splitter import GroupedSplitter
+        from federatedscope.core.splitters.generic import LDASplitter, MetaSplitter
+        
+        # Check for required arguments
+        if 'num_groups' not in kwargs:
+            raise ValueError("`num_groups` must be specified in "
+                             "`data.splitter_args` for grouped splitter.")
+        if 'base_splitter_type' not in kwargs:
+            raise ValueError("`base_splitter_type` (e.g., 'lda' or 'meta') "
+                             "must be specified in `data.splitter_args`.")
+        
+        num_groups = kwargs.pop('num_groups')
+        base_splitter_type = kwargs.pop('base_splitter_type')
+        
+        print(f"[*] GroupedSplitter: Found configuration:")
+        print(f"    - Total clients: {client_num}")
+        print(f"    - Number of groups: {num_groups}")
+        print(f"    - Base splitter for inter-group split: '{base_splitter_type}'")
+
+        # Create the base splitter instance based on the type
+        if base_splitter_type == 'lda':
+            print(f"    - Args for LDASplitter: {kwargs}")
+            # Pass remaining kwargs (like alpha) to the base splitter
+            base_splitter_instance = LDASplitter(client_num, **kwargs)
+        elif base_splitter_type == 'meta':
+            print(f"    - Args for MetaSplitter: {kwargs}")
+            base_splitter_instance = MetaSplitter(client_num, **kwargs)
+        else:
+            raise ValueError(f"Unsupported base_splitter_type: "
+                             f"{base_splitter_type}")
+            
+        splitter = GroupedSplitter(client_num, num_groups, base_splitter_instance)
+        print("="*24 + " GroupedSplitter Built " + "="*25 + "\n")
+    elif config.data.splitter == 'lda':
         from federatedscope.core.splitters.generic import LDASplitter
         splitter = LDASplitter(client_num, **kwargs)
     # graph splitter

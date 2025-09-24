@@ -19,9 +19,16 @@ federate:
   save_to: "gpt2_alpaca.ckpt"
 data:
   root: data/
-  type: 'alpaca@llm'
+  type: 'rosetta_alpaca@llm'
   splits: [0.98,0.01,0.01]
-  splitter: 'iid'
+  splitter: 'grouped'
+  splitter_args: [ 
+    {
+      num_groups: 2,
+      base_splitter_type: 'lda',
+      alpha: 0.1
+    }
+  ]
 distribute:
   use: True
   server_host: '127.0.0.1'

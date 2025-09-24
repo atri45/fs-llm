@@ -1485,9 +1485,6 @@ class FedSpeedEngine:
                 layer_vec = torch.empty(vec_size, dtype=layer_params[0].dtype, device=self.device)
                 
                 if self.rank == src_rank:
-                    logger.info(f"  - Rank {self.rank} is source for layer '{layer_name}'. Reconstructing and broadcasting...")
-                    
-                    # --- 【核心修正】---
                     # a. 在本地重组出这一层【完整】的、最新的参数
                     reconstructed_layer_params = []
                     for param in layer_params:
@@ -1535,8 +1532,6 @@ class FedSpeedEngine:
                     
                     # a. 更新我的持久化分片 (如果我负责这个参数)
                     if name in self._my_persistent_shards:
-                        logger.info(f"update param: {name}")
-                        sharding_info = self.sharding_metadata[name]
                         my_rank_info = sharding_info['ranks_info'][self.rank]
                         offset, size = my_rank_info['offset'], my_rank_info['size']
                         
