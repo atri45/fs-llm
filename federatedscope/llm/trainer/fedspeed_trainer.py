@@ -109,6 +109,7 @@ class FedSpeedTrainer(LLMTrainer):
         self.aggregation_mode = self.config.federate.get('aggregation_mode') 
         self.is_decentralized_sharded_mode = (self.aggregation_mode == 'shardedGradient')
         self.aggregation_steps = self.config.federate.get('aggregation_steps') 
+        self.stage_one_steps = self.cfg.federate.two_stages.get('stage_one_steps', 250)
         self.asynchronous = self._cfg.federate.get('asynchronous_aggregation', False)
         self.adaptive_weight_cfg = self.cfg.federate.get('adaptive_weight', {'use': False})
         self.gossip_num = self._cfg.federate.get('gossip_num', 1)
@@ -222,6 +223,11 @@ class FedSpeedTrainer(LLMTrainer):
                 self.fedspeed_engine.temp_full_gradients.clear()
             return
         self.current_step += 1
+        self.fedspeed_engine.current_step += 1
+
+        # --- 检查是否需要阶段转换 ---
+        if self.fedspeed_engine.noniid and self.current_step == self.stage_one_steps:
+            self._trigger_stage_transition()
 
         # 通用异步逻辑 (消息处理)
         logger.debug(f"process_incoming_messages")
@@ -251,7 +257,7 @@ class FedSpeedTrainer(LLMTrainer):
             updated_shards_for_broadcast, model_was_updated_by_peers = self.fedspeed_engine.sharded_step(my_local_grad_shards)
 
             # 4. 异步推送更新后的参数分片 (非匿名)
-            if model_was_updated_by_peers:
+            if model_was_updated_by_peers and self.fedspeed_engine.current_step > self.fedspeed_engine.stage_one_steps:
                 logger.debug(f"broadcast_shard_updates")
                 self.broadcast_shard_updates(updated_shards_for_broadcast)
 
@@ -277,14 +283,15 @@ class FedSpeedTrainer(LLMTrainer):
                     if message.msg_type == 'aggregated_model_para':
                         self.handle_model(message)
 
-        # 日志和评估 (与原逻辑一致)
+        # 日志和评估
         my_rank = dist.get_rank()
         logger.info(f"--- Rank {my_rank} | Step {self.current_step} | Loss: {ctx.loss_batch.item():.4f} ---")
         ctx.num_samples += ctx.batch_size
         ctx.loss_batch_total += ctx.loss_batch.item() * ctx.batch_size
-        if self.eval_freq > 0 and (self.current_step % self.eval_freq) == 0:
+        stage_one_steps = self.cfg.federate.get('stage_one_steps', 0)
+        if self.eval_freq > 0 and (self.current_step % self.eval_freq) == 0 and self.current_step > stage_one_steps:
             self.evaluation()
-        
+
         # 在每一步结束时，检查全局共识
         if self.early_stopper:
             self.early_stopper.check_global_consensus_and_stop(self.global_early_stop_votes)
@@ -298,6 +305,22 @@ class FedSpeedTrainer(LLMTrainer):
         if self.comm_executor:
             self.comm_executor.shutdown(wait=True)
             self.comm_executor = None
+
+    def _trigger_stage_transition(self):
+        """
+        执行从阶段一到阶段二的转换。
+        """
+        logger.info(f"--- [Client #{self.client_id}] Triggering transition from Stage 1 to Stage 2 at step {self.fedspeed_engine.current_step} ---")
+        
+        # 1. 调用 Engine 执行全局模型同步
+        self.fedspeed_engine.sync_model_at_stage_transition()
+        
+        # 2. (可选) 重置优化器状态
+        #    因为模型参数发生了剧变，重置优化器状态（如动量）可能有助于稳定阶段二的训练
+        # logger.info("Re-initializing optimizer for Stage 2.")
+        # self.fedspeed_engine._initialize_optimizer()
+
+        logger.info("--- Stage transition complete. Now entering Stage 2: Global Fine-tuning. ---")
 
     def passive_receive_message(self, message: Message):
         """

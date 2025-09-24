@@ -45,7 +45,11 @@ def extend_fl_setting_cfg(cfg):
     cfg.federate.cpu_mem_pressure_threshold= 0.9
     cfg.federate.prefetch_depth= 2
     cfg.federate.transformer_block_class_name= 'GPT2Block'
-    cfg.federate.two_stage_training= True
+    cfg.federate.two_stages= CN()
+    cfg.federate.two_stages.use= False
+    cfg.federate.two_stages.stage_one_steps= 100
+    cfg.federate.two_stages.noniid= False
+    cfg.federate.two_stages.group_num= 2
     cfg.federate.stage_one_steps= 250
     cfg.federate.use_activation_checkpointing = True
     cfg.federate.adaptive_weight= CN()

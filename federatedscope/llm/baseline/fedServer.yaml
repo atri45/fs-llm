@@ -9,6 +9,11 @@ federate:
   anonymous_routing: False
   use_activation_checkpointing: True
   use_offline_model: True
+  two_stages: 
+    use: True
+    stage_one_steps: 100
+    noniid: True
+    group_num: 2
   mode: distributed
   client_num: 4
   save_to: "gpt2_alpaca.ckpt"

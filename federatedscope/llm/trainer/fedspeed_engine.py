@@ -309,8 +309,10 @@ class FedSpeedEngine:
         self.aggregation_steps = self.cfg.federate.get('aggregation_steps', 1)
         self.local_cache_path = self.cfg.federate.get('model_cache_path')
         self.use_offline_model = self.cfg.federate.get('use_offline_model', False)
-        self.two_stage = self.cfg.federate.get('two_stage_training', False)
-        self.stage_one_steps = self.cfg.federate.get('stage_one_steps', 250)
+        self.two_stage = self.cfg.federate.two_stages.get('use', False)
+        self.stage_one_steps = self.cfg.federate.two_stages.get('stage_one_steps', 250)
+        self.noniid = self.cfg.federate.two_stages.get('noniid', False)
+        self.is_in_stage_one = self.two_stage
         self.local_trainable_names_stage1 = None
         self.should_aggregate = False
         self._my_persistent_shards = {}
@@ -344,20 +346,29 @@ class FedSpeedEngine:
         self.module_to_params_map = {}
         self.id_to_param_map = {}
         self.name_to_param_map = {name: p for name, p in self.model.named_parameters()}
-        self.trainable_param_names = {name for name, p in self.model.named_parameters() if p.requires_grad}
-        self.ordered_trainable_names = sorted(list(self.trainable_param_names), key=natural_sort_key)
+
+        # 存储分组元数据
+        self.grouping_metadata = initial_shards.get('grouping_metadata', {})
+        self.my_group_id = None
+        self.my_layers_indices = []
+        self.layer_to_peers_map = {}
+        self.logical_layers_names = []
+        self._param_to_layer_index_map = {} # 用于快速查找
 
         # --- 初始化引擎核心状态 ---
+        if self.noniid and self.grouping_metadata:
+            self.my_group_id = self.grouping_metadata['client_to_group_map'].get(self.rank)
+            self.my_layers_indices = self.grouping_metadata['client_to_layers_map'].get(self.rank, [])
+            self.layer_to_peers_map = self.grouping_metadata['layer_to_peers_map']
+            self.logical_layers_names = self.grouping_metadata['logical_layers_names']
+            # 构建一个参数名到层索引的快速查找映射
+            self._build_param_to_layer_index_map()
+        
         self._attach_module_ids()
         self.sharding_metadata = initial_shards.get('sharding_metadata', {})
         if self.aggregation_mode in ['local-reconstruct', 'shardedGradient']:
             state_dict = initial_shards.get('full_model_state_dict')
             self._initialize_from_full_state_dict(state_dict)
-            
-            # 为 decentralized 模式设置特定属性
-            if self.aggregation_mode == 'shardedGradient':
-                self.grad_shard_buffer = {name: [] for name in self.trainable_param_names}
-                self.rank_to_client_id_map = initial_shards.get('rank_to_client_id_map')
 
         else: # 处理 'gradient', 'model', 'fl-sim' 等基于分片的模式
             logger.info(f"Initializing engine from sharded data for mode '{self.aggregation_mode}'.")
@@ -365,6 +376,12 @@ class FedSpeedEngine:
 
         # --- 设置所有参数的初始状态 ---
         self._set_initial_param_status()
+        self.trainable_param_names = {name for name, p in self.model.named_parameters() if p.requires_grad}
+        self.ordered_trainable_names = sorted(list(self.trainable_param_names), key=natural_sort_key)
+        # 为 decentralized 模式设置特定属性
+        if self.aggregation_mode == 'shardedGradient':
+            self.grad_shard_buffer = {name: [] for name in self.trainable_param_names}
+            self.rank_to_client_id_map = initial_shards.get('rank_to_client_id_map')
         self._build_module_param_map()
         self._initialize_optimizer()
     
@@ -494,6 +511,31 @@ class FedSpeedEngine:
 
         with open(done_file, 'w') as f: f.write('done')
         logger.info(f"Rank {self.rank}: Successfully created cache for {num_frozen_params_saved} frozen parameters.")
+
+    def _build_param_to_layer_index_map(self):
+        """
+        构建一个从参数全名到其所属逻辑层索引的映射。
+        """
+        if not self.logical_layers_names:
+            return
+        
+        # 创建一个层名称到索引的映射
+        layer_name_to_idx = {name: i for i, name in enumerate(self.logical_layers_names)}
+        sorted_layer_names = sorted(self.logical_layers_names, key=len, reverse=True)
+
+        for param_name, param in self.model.named_parameters():
+            # 遍历排序后的层名称
+            for layer_name in sorted_layer_names:
+                # 1. 检查是否是前缀
+                if param_name.startswith(layer_name):
+                    # 2. 检查前缀后面的字符是否是 '.' 或字符串结尾
+                    #    这可以防止 'h.1' 错误地匹配 'h.10'
+                    if len(param_name) == len(layer_name) or param_name[len(layer_name)] == '.':
+                        layer_idx = layer_name_to_idx.get(layer_name)
+                        if layer_idx is not None:
+                            self._param_to_layer_index_map[param_name] = layer_idx
+                            break # 找到最精确的匹配后就跳出
+        logger.info(f"Built parameter-to-layer-index map for {len(self._param_to_layer_index_map)} parameters.")
 
     def _attach_module_ids(self):
         """
@@ -1291,62 +1333,228 @@ class FedSpeedEngine:
         2. 调用分片优化器更新。
         3. 返回更新后的参数分片信息，用于广播。
         """
-        if self.aggregation_mode != 'shardedGradient' or not self.local_optimizer:
-            # 如果不是这个模式，调用旧的 step 逻辑
-            # 为了简化，我们假设这里只处理新模式。你需要保留旧的 step 逻辑。
-            # return self._original_step_logic(...) 
-            return None # 暂定
+        if not self.local_optimizer:
+            return [], False
 
-        updated_shards_for_broadcast = []
-        model_was_updated_by_peers = False  
-
-        # 遍历由我的分片优化器管理的每个参数分片
-        for param_shard_view in self.local_optimizer.param_groups[0]['params']:
-            param_name = param_shard_view.fedspeed_name
+        # --- 阶段一：层聚合与梯度掩码 ---
+        if self.noniid and self.is_in_stage_one:
             
-            # 1. 聚合梯度 (FedAvg)
-            # a. 获取本地计算出的梯度分片
-            local_grad_shard = my_local_grad_shards.get(param_name)
-            if local_grad_shard is None:
-                logger.warning(f"Local grad shard for '{param_name}' not found. Skipping update.")
-                continue
-                
-            # b. 获取从网络接收的梯度分片
-            received_grad_shards = self.grad_shard_buffer.get(param_name, [])
+            # 1. 聚合收到的层梯度 (FedAvg)
+            all_grads_for_update = {name: [] for name in self.ordered_trainable_names}
             
-            # c. 将所有梯度分片（本地的+接收的）聚合
-            if received_grad_shards:
-                model_was_updated_by_peers = True
-                all_shards_for_avg = [local_grad_shard] + [s.to(self.device) for s in received_grad_shards]
-                avg_grad_shard = torch.stack(all_shards_for_avg).mean(dim=0)
-                param_shard_view.grad = avg_grad_shard
-            else:
-                # 如果没有收到任何远程梯度，只使用本地梯度更新
-                param_shard_view.grad = local_grad_shard.to(self.device)
+            # a. 加入自己本地计算的梯度
+            for name, grad in my_local_grad_shards.items():
+                all_grads_for_update[name].append(grad)
 
-            # d. 清理缓冲区
-            if param_name in self.grad_shard_buffer:
-                self.grad_shard_buffer[param_name] = []
+            # b. 从缓冲区中加入接收到的梯度
+            for name, received_shards in self.grad_shard_buffer.items():
+                all_grads_for_update[name].extend(received_shards)
 
-        self.local_optimizer.step()
-        self._write_back_persistent_shards_to_gpu_cache()
+            # 2. 执行 FedAvg 并应用梯度掩码
+            with torch.no_grad():
+                for param_shard_view in self.local_optimizer.param_groups[0]['params']:
+                    param_name = param_shard_view.fedspeed_name
+                    
+                    # 检查这个参数是否属于我负责的层
+                    layer_idx = self._param_to_layer_index_map.get(param_name)
+                    if layer_idx not in self.my_layers_indices:
+                        # 【梯度掩码】不属于我，梯度设为 0
+                        param_shard_view.grad = torch.zeros_like(param_shard_view.data)
+                        continue
+                    
+                    # 属于我，进行聚合
+                    grad_list = all_grads_for_update.get(param_name, [])
+                    if not grad_list:
+                        logger.warning(f"[Stage 1] No gradient found for my layer param '{param_name}'. Setting grad to zero.")
+                        param_shard_view.grad = torch.zeros_like(param_shard_view.data)
+                        continue
+                    
+                    # 执行 FedAvg
+                    avg_grad = torch.stack(grad_list).mean(dim=0)
+                    
+                    # 【重要】平均后的梯度是完整的，需要切分出我的分片
+                    sharding_info = self.sharding_metadata[param_name]
+                    my_rank_info = sharding_info['ranks_info'][self.rank]
+                    offset, size = my_rank_info['offset'], my_rank_info['size']
+                    
+                    avg_grad_shard = avg_grad.narrow(sharding_info['split_dim'], offset, size)
+                    param_shard_view.grad = avg_grad_shard.to(self.device)
 
-        # 3. 准备广播更新后的参数分片
-        with torch.no_grad():
+                    # d. 清理缓冲区
+                    if param_name in self.grad_shard_buffer:
+                        self.grad_shard_buffer[param_name] = []
+
+            # 3. 更新模型
+            self.local_optimizer.step()
+            self.local_optimizer.zero_grad()
+
+            # 阶段一不广播参数，返回空值
+            return [], False
+
+        # --- 阶段二 或 非分组模式：按参数分片更新 (你已有的逻辑) ---
+        else:
+            # 优化器更新
+            updated_shards_for_broadcast = []
+            model_was_updated_by_peers = False  
+
+            # 遍历由我的分片优化器管理的每个参数分片
             for param_shard_view in self.local_optimizer.param_groups[0]['params']:
-                broadcast_content = {
-                    'param_name': param_shard_view.fedspeed_name,
-                    'shard_data': param_shard_view.data.cpu().clone(),
-                    'source_rank': self.rank,
-                    'step': self.current_step
-                }
-                updated_shards_for_broadcast.append(broadcast_content)
-        
-        return updated_shards_for_broadcast, model_was_updated_by_peers
+                param_name = param_shard_view.fedspeed_name
+                
+                # 1. 聚合梯度 (FedAvg)
+                # a. 获取本地计算出的梯度分片
+                local_grad_shard = my_local_grad_shards.get(param_name)
+                if local_grad_shard is None:
+                    logger.warning(f"Local grad shard for '{param_name}' not found. Skipping update.")
+                    continue
+                    
+                # b. 获取从网络接收的梯度分片
+                received_grad_shards = self.grad_shard_buffer.get(param_name, [])
+                
+                # c. 将所有梯度分片（本地的+接收的）聚合
+                if received_grad_shards:
+                    model_was_updated_by_peers = True
+                    all_shards_for_avg = [local_grad_shard] + [s.to(self.device) for s in received_grad_shards]
+                    avg_grad_shard = torch.stack(all_shards_for_avg).mean(dim=0)
+                    param_shard_view.grad = avg_grad_shard
+                else:
+                    # 如果没有收到任何远程梯度，只使用本地梯度更新
+                    param_shard_view.grad = local_grad_shard.to(self.device)
+
+                # d. 清理缓冲区
+                if param_name in self.grad_shard_buffer:
+                    self.grad_shard_buffer[param_name] = []
+
+            self.local_optimizer.step()
+            self._write_back_persistent_shards_to_gpu_cache()
+
+            # 准备广播更新后的参数分片
+            if self.should_aggregate:
+                with torch.no_grad():
+                    for param_shard_view in self.local_optimizer.param_groups[0]['params']:
+                        broadcast_content = {
+                            'param_name': param_shard_view.fedspeed_name,
+                            'shard_data': param_shard_view.data.cpu().clone(),
+                            'source_rank': self.rank,
+                            'step': self.current_step
+                        }
+                        updated_shards_for_broadcast.append(broadcast_content)
+            
+            self.temp_full_gradients.clear() 
+            # 回收显存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            return updated_shards_for_broadcast, model_was_updated_by_peers
+
+    def sync_model_at_stage_transition(self):
+        """
+        在阶段一结束时，执行全局模型同步。
+        每个客户端贡献出自己负责的最新参数层，然后大家通过 all-gather 重建完整模型。
+        """
+        if not (self.noniid and self.is_in_stage_one):
+            logger.warning("sync_model_at_stage_transition called but not in stage one of grouping mode.")
+            return
+
+        logger.info(f"Rank {self.rank}: Starting global model synchronization at stage transition...")
+
+        with torch.no_grad():
+            # 遍历所有逻辑层
+            for layer_idx, layer_name in enumerate(self.logical_layers_names):
+                # 找到这一层的所有参数
+                layer_params = [
+                    self.name_to_param_map[name]
+                    for name in self.ordered_trainable_names
+                    if self._param_to_layer_index_map.get(name) == layer_idx
+                ]
+
+                if not layer_params:
+                    logger.debug(f"No trainable parameters found for layer {layer_idx} ('{layer_name}'). Skipping sync.")
+                    continue
+                
+                # 确定谁是这一层的“源” (source of truth)
+                # 理论上，layer_to_peers_map[layer_idx] 里的所有人都拥有最新版本
+                # 我们选择 rank 最小的那个作为广播源 (src_rank)
+                src_rank = min(self.layer_to_peers_map[layer_idx])
+                
+                # 计算正确的向量大小
+                vec_size = sum(p.numel() for p in layer_params)
+                if vec_size == 0: continue
+
+                # 创建发送/接收缓冲区
+                layer_vec = torch.empty(vec_size, dtype=layer_params[0].dtype, device=self.device)
+                
+                if self.rank == src_rank:
+                    logger.info(f"  - Rank {self.rank} is source for layer '{layer_name}'. Reconstructing and broadcasting...")
+                    
+                    # --- 【核心修正】---
+                    # a. 在本地重组出这一层【完整】的、最新的参数
+                    reconstructed_layer_params = []
+                    for param in layer_params:
+                        name = param.fedspeed_name
+                        
+                        # i. 从 CPU 缓存获取完整的、微过时的参数
+                        if name not in self.reconstructor.cpu_cache:
+                            logger.error(f"Param '{name}' not found in CPU cache during sync. Using zeros.")
+                            reconstructed_layer_params.append(torch.zeros_like(param, device=self.device))
+                            continue
+                        
+                        full_param_cpu = self.reconstructor.cpu_cache[name].clone()
+                        
+                        # ii. 用自己最新的持久化分片去修正它
+                        if name in self._my_persistent_shards:
+                            my_latest_shard = self._my_persistent_shards[name].data.cpu()
+                            sharding_info = self.sharding_metadata[name]
+                            my_rank_info = sharding_info['ranks_info'][self.rank]
+                            offset, size = my_rank_info['offset'], my_rank_info['size']
+                            full_param_cpu.narrow(sharding_info['split_dim'], offset, size).copy_(my_latest_shard)
+                        
+                        reconstructed_layer_params.append(full_param_cpu.to(self.device))
+                        
+                    # b. 将重组后的【完整】参数列表，打包到 layer_vec 中
+                    source_vec = parameters_to_vector(reconstructed_layer_params)
+                    layer_vec.copy_(source_vec) # 使用 copy_ 填充
+                
+                # 执行广播
+                dist.broadcast(layer_vec, src=src_rank, group=self.comm_group)
+
+                # 所有客户端都用收到的向量来更新自己的【持久化分片】和【CPU缓存】
+                # 1. 恢复出完整的、更新后的层参数
+                temp_layer_params_data = []
+                pointer = 0
+                for param in layer_params:
+                    num_param = param.numel()
+                    param_data = layer_vec[pointer : pointer + num_param].view_as(param)
+                    temp_layer_params_data.append(param_data)
+                    pointer += num_param
+
+                # 2. 遍历这些更新后的层参数，更新自己系统中的相应部分
+                for i, param in enumerate(layer_params):
+                    updated_full_param_data = temp_layer_params_data[i]
+                    name = param.fedspeed_name
+                    
+                    # a. 更新我的持久化分片 (如果我负责这个参数)
+                    if name in self._my_persistent_shards:
+                        logger.info(f"update param: {name}")
+                        sharding_info = self.sharding_metadata[name]
+                        my_rank_info = sharding_info['ranks_info'][self.rank]
+                        offset, size = my_rank_info['offset'], my_rank_info['size']
+                        
+                        # 从更新后的完整参数中切出我的新分片
+                        new_shard_data = updated_full_param_data.narrow(sharding_info['split_dim'], offset, size)
+                        self._my_persistent_shards[name].data.copy_(new_shard_data)
+
+                    # b. 更新 CPU 缓存
+                    if self.reconstructor and name in self.reconstructor.cpu_cache:
+                        self.reconstructor.cpu_cache[name].copy_(updated_full_param_data.cpu())
+
+        dist.barrier()
+        logger.info(f"Rank {self.rank}: Global model synchronization complete.")
+        self.is_in_stage_one = False
 
     def _write_back_persistent_shards_to_gpu_cache(self):
         """
-        [新方法] 将更新后的持久化分片，写回到 Reconstructor 的 GPU 缓存中。
+        将更新后的持久化分片，写回到 Reconstructor 的 GPU 缓存中。
         这是确保模型更新能被下一次迭代使用的关键步骤。
         """
         # 检查 Reconstructor 和它的 GPU 缓存是否存在
@@ -1385,57 +1593,120 @@ class FedSpeedEngine:
         if not self.temp_full_gradients:
             return {}, []
 
-        my_local_grad_shards = {}
-        # 结构: { target_rank_1: [shard_content_A, shard_content_B], target_rank_2: [...] }
-        grouped_shards_to_dispatch = {}
-
-
-        for name, full_grad in self.temp_full_gradients.items():
-            param_sharding_info = self.sharding_metadata.get(name)
-            if not param_sharding_info:
-                continue
-
-            split_dim = param_sharding_info['split_dim']
+        # --- 阶段一：分组跨组层聚合 ---
+        if self.noniid and self.is_in_stage_one:
+            my_local_full_gradients = {name: grad.clone() for name, grad in self.temp_full_gradients.items()}
             
-            split_sizes = [info['size'] for rank, info in sorted(param_sharding_info['ranks_info'].items())]
-            grad_shards_list = torch.split(full_grad, split_sizes, dim=split_dim)
+            # 2. 准备分发的梯度（只在聚合步）
+            grouped_shards_to_dispatch = {}
+            
+            # 检查是否是聚合步
+            should_aggregate_now = (self.current_step) % self.aggregation_steps == 0
+            
+            if should_aggregate_now:
+                logger.info(f"[Stage 1] Aggregation step. Preparing to dispatch layer gradients.")
+                # 将梯度按层分组
+                grads_by_layer = {i: {} for i in range(len(self.logical_layers_names))}
+                for name, grad in self.temp_full_gradients.items():
+                    layer_idx = self._param_to_layer_index_map.get(name)
+                    if layer_idx is not None:
+                        grads_by_layer[layer_idx][name] = grad
 
-            for rank_idx, grad_shard in enumerate(grad_shards_list):
-                if rank_idx == self.rank:
-                    my_local_grad_shards[name] = grad_shard
-                else:
-                    # 这是需要发给别人的分片
-                    if self.aggregation_steps > 1:
-                        # 多步模式：存入累加器
-                        target_rank = rank_idx
-                        if target_rank not in self.remote_grad_accumulator:
-                            self.remote_grad_accumulator[target_rank] = {}
-                        if name not in self.remote_grad_accumulator[target_rank]:
-                            self.remote_grad_accumulator[target_rank][name] = {'sum': torch.zeros_like(grad_shard), 'count': 0}
+                # 按层准备要发送的消息
+                for layer_idx, layer_grads_dict in grads_by_layer.items():
+                    if not layer_grads_dict: continue
+                    
+                    # 找到通信同伴
+                    peer_ranks = self.layer_to_peers_map.get(layer_idx, [])
+                    if layer_idx not in self.my_layers_indices:
+                        logger.debug(f"    - Skipping layer {layer_idx} as it's not my responsibility.")
+                        continue
+                    for target_rank in peer_ranks:
+                        if target_rank == self.rank: continue
                         
-                        self.remote_grad_accumulator[target_rank][name]['sum'].add_(grad_shard)
-                        self.remote_grad_accumulator[target_rank][name]['count'] += 1
-                    else:
-                        dispatch_content = {
-                            'param_name': name,
-                            'grad_shard_data': grad_shard.cpu().clone(),
-                            'source_rank': self.rank,
-                        }
-                        target_client_id = self.rank_to_client_id_map.get(rank_idx)
+                        target_client_id = self.rank_to_client_id_map.get(target_rank)
+                        if not target_client_id: continue
 
-                        # 将这个分片内容添加到对应目标rank的列表中
                         if target_client_id not in grouped_shards_to_dispatch:
                             grouped_shards_to_dispatch[target_client_id] = []
-                        grouped_shards_to_dispatch[target_client_id].append(dispatch_content)
-        
-        self.temp_full_gradients.clear()
+                        
+                        # 打包整个层的梯度
+                        for name, grad in layer_grads_dict.items():
+                            dispatch_content = {
+                                'param_name': name,
+                                'grad_shard_data': grad.cpu().clone(),
+                                'source_rank': self.rank,
+                            }
+                            grouped_shards_to_dispatch[target_client_id].append(dispatch_content)
+            
+            self.temp_full_gradients.clear()
+            # 返回完整的本地梯度 和 (可能为空的)待分发梯度
+            return my_local_full_gradients, grouped_shards_to_dispatch
 
-        if self.aggregation_steps > 1:
-            if self.current_step % self.aggregation_steps == 0:
-                grouped_shards_to_dispatch = self._prepare_dispatch_from_accumulator()
+        else:
+            my_local_grad_shards = {}
+            grouped_shards_to_dispatch = {}
 
-        # 返回本地分片 和 按目标分组的待发送分片
-        return my_local_grad_shards, grouped_shards_to_dispatch
+            # 检查是否需要聚合
+            self.should_aggregate = False
+            if self.two_stage:
+                if self.current_step == self.stage_one_steps:
+                    # 阶段转换点，强制聚合
+                    self.should_aggregate = True
+                elif self.current_step > self.stage_one_steps and self.current_step % self.aggregation_steps == 0:
+                    # 第二阶段，按频率聚合
+                    self.should_aggregate = True
+                # else: 第一阶段，不聚合
+            else: # 非两阶段模式
+                if self.current_step % self.aggregation_steps == 0:
+                    self.should_aggregate = True
+
+            for name, full_grad in self.temp_full_gradients.items():
+                param_sharding_info = self.sharding_metadata.get(name)
+                if not param_sharding_info:
+                    continue
+
+                split_dim = param_sharding_info['split_dim']
+                
+                split_sizes = [info['size'] for rank, info in sorted(param_sharding_info['ranks_info'].items())]
+                grad_shards_list = torch.split(full_grad, split_sizes, dim=split_dim)
+
+                for rank_idx, grad_shard in enumerate(grad_shards_list):
+                    if rank_idx == self.rank:
+                        my_local_grad_shards[name] = grad_shard
+                    elif self.should_aggregate:
+                        # 这是需要发给别人的分片
+                        if self.aggregation_steps > 1:
+                            # 多步模式：存入累加器
+                            target_rank = rank_idx
+                            if target_rank not in self.remote_grad_accumulator:
+                                self.remote_grad_accumulator[target_rank] = {}
+                            if name not in self.remote_grad_accumulator[target_rank]:
+                                self.remote_grad_accumulator[target_rank][name] = {'sum': torch.zeros_like(grad_shard), 'count': 0}
+                            
+                            self.remote_grad_accumulator[target_rank][name]['sum'].add_(grad_shard)
+                            self.remote_grad_accumulator[target_rank][name]['count'] += 1
+                        else:
+                            dispatch_content = {
+                                'param_name': name,
+                                'grad_shard_data': grad_shard.cpu().clone(),
+                                'source_rank': self.rank,
+                            }
+                            target_client_id = self.rank_to_client_id_map.get(rank_idx)
+
+                            # 将这个分片内容添加到对应目标rank的列表中
+                            if target_client_id not in grouped_shards_to_dispatch:
+                                grouped_shards_to_dispatch[target_client_id] = []
+                            grouped_shards_to_dispatch[target_client_id].append(dispatch_content)
+            
+            self.temp_full_gradients.clear()
+
+            if self.aggregation_steps > 1:
+                if self.current_step % self.aggregation_steps == 0:
+                    grouped_shards_to_dispatch = self._prepare_dispatch_from_accumulator()
+
+            # 返回本地分片 和 按目标分组的待发送分片
+            return my_local_grad_shards, grouped_shards_to_dispatch
 
     def _prepare_dispatch_from_accumulator(self):
         """
@@ -1730,6 +2001,10 @@ class FedSpeedCoordinatorEngine:
 
     def _build_module_param_map(self):
         """在初始化时，遍历一次模型，构建模块到其直属参数的映射。"""
+        for name, module in self.model.named_modules():
+             # name 是全局唯一的名称，例如 'transformer.h.0.attn'
+             if name: # 跳过根模块
+                 module.fedspeed_name = name
         for module in self.model.modules():
             if not hasattr(module, 'fedspeed_id'):
                 module.fedspeed_id = id(module)
@@ -1776,14 +2051,22 @@ class FedSpeedCoordinatorEngine:
         # --- 1. 获取配置 ---
         aggregation_mode = self.cfg.federate.get('aggregation_mode', 'gradient')
         use_offline_model = self.cfg.federate.get('use_offline_model', False)
-        
+        noniid = self.cfg.federate.two_stages.get('noniid', False)
+
         # --- 2. 演练引用计数 (基础梯度模式) ---
         # 引用计数与模型如何分发无关，只与计算图有关，所以可以先计算
         ref_counts_package = None
         if aggregation_mode == 'gradient':
             ref_counts_package = self._profile_ref_counts()
 
-        # --- 3. 根据不同的聚合模式，准备不同的数据包内容 ---
+        # --- 3. 计算分组元数据 (如果启用) ---
+        grouping_metadata = {}
+        logger.info(f"noniid: {noniid}")
+        if noniid:
+            # 在执行任何操作前，确保模块有全局名称
+            grouping_metadata = self._calculate_grouping_and_layer_assignments()
+
+        # --- 4. 根据不同的聚合模式，准备不同的数据包内容 ---
         
         # --- Case A: 新的去中心化分片FedAvg模式 ---
         if aggregation_mode == 'shardedGradient':
@@ -1896,17 +2179,106 @@ class FedSpeedCoordinatorEngine:
             # 为每个客户端准备其专属的分片包
             all_client_packages_content = [{'shards': all_param_shards[rank]} for rank in range(self.world_size)]
 
-        # --- 4. 最终打包：将通用信息与特定内容合并 ---
+        # --- 5. 最终打包：将通用信息与特定内容合并 ---
         all_client_packages = []
         for rank in range(self.world_size):
             client_package = all_client_packages_content[rank]
             client_package['ref_counts'] = ref_counts_package
+            if noniid:
+                client_package.update(grouping_metadata)
             all_client_packages.append(client_package)
         
         logger.info("[Coordinator] All client packages created successfully.")
 
         return all_client_packages
     
+    def _calculate_grouping_and_layer_assignments(self):
+        """
+        【新函数】计算客户端分组、层分配和跨组通信映射。
+        """
+        num_groups = self.cfg.federate.two_stages.get('group_num', 2)
+        if self.world_size < num_groups:
+            raise ValueError(f"world_size ({self.world_size}) cannot be smaller than num_groups ({num_groups}).")
+
+        client_ranks = list(range(self.world_size))
+
+        # --- 1. 健壮的客户端分组 (支持不均匀) ---
+        # 使用 torch.chunk 来获得最均衡的分组
+        group_assignments = torch.chunk(torch.tensor(client_ranks), num_groups)
+        group_info = {i: group.tolist() for i, group in enumerate(group_assignments)}
+        
+        client_to_group_map = {}
+        for group_id, members in group_info.items():
+            for rank in members:
+                client_to_group_map[rank] = group_id
+        
+        logger.info(f"Grouping results ({num_groups} groups): {group_info}")
+        
+        # --- 2. 识别模型中的逻辑层 (不变) ---
+        block_class_name = self.cfg.federate.get('transformer_block_class_name')
+        if not block_class_name:
+            raise ValueError("`transformer_block_class_name` must be specified for grouping.")
+        
+        logical_layers = []
+        for module in self.model.modules():
+            if module.__class__.__name__ == block_class_name:
+                if not hasattr(module, 'fedspeed_name'):
+                    raise AttributeError(f"Module {module.__class__.__name__} is missing 'fedspeed_name'.")
+                logical_layers.append(module)
+        
+        total_layers = len(logical_layers)
+        if total_layers == 0:
+            raise ValueError(f"No logical layers of type '{block_class_name}' found in the model.")
+
+        # --- 3. 【核心修改】在每个组内部独立进行层分配 ---
+        client_to_layers_map = {}
+        # 这个字典用于构建通信图: slot_idx -> [ranks]
+        # slot_idx 代表一个组内成员的索引 (第0个成员, 第1个成员...)
+        peers_by_slot = {}
+
+        for group_id, members in group_info.items():
+            num_members = len(members)
+            if total_layers < num_members:
+                 raise ValueError(f"In group {group_id}, total layers ({total_layers}) is less than group size ({num_members}). Cannot assign layers.")
+            
+            layer_indices = torch.arange(total_layers)
+            # 在组内部分配层
+            layer_chunks_in_group = torch.chunk(layer_indices, num_members)
+            
+            for i, member_rank in enumerate(members):
+                # a. 分配层
+                assigned_layers_indices = layer_chunks_in_group[i].tolist()
+                client_to_layers_map[member_rank] = assigned_layers_indices
+                
+                # b. 填充 peers_by_slot，用于下一步构建通信图
+                slot_idx = i # 组内索引
+                if slot_idx not in peers_by_slot:
+                    peers_by_slot[slot_idx] = []
+                peers_by_slot[slot_idx].append(member_rank)
+
+        # --- 4. 构建跨组通信映射 ---
+        layer_to_peers_map = {i: [] for i in range(total_layers)}
+        for layer_idx in range(total_layers):
+            # 对于每一层，遍历所有客户端，看谁负责它
+            for rank in client_ranks:
+                if layer_idx in client_to_layers_map.get(rank, []):
+                    layer_to_peers_map[layer_idx].append(rank)
+
+        logger.debug(f"Client layer assignments (in-group model parallelism): {client_to_layers_map}")
+        logger.debug(f"Layer-to-peer communication map: {layer_to_peers_map}")
+
+        logical_layers_names = [m.fedspeed_name for m in logical_layers]
+
+        return {
+            "grouping_metadata": {
+                "client_to_group_map": client_to_group_map,
+                "group_info": group_info,
+                "client_to_layers_map": client_to_layers_map,
+                "layer_to_peers_map": layer_to_peers_map,
+                "logical_layers_names": logical_layers_names 
+            }
+        }
+
     def _profile_ref_counts(self):
         """
         辅助方法：执行一次“演练”来计算所有参数的引用计数。
