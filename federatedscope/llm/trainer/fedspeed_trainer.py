@@ -1,11 +1,14 @@
 import logging
 import pickle
 import base64
+import time
 import torch
 import torch.distributed as dist
 import random
 import os
 import queue
+import psutil
+import numpy as np
 
 from federatedscope.core.monitors.monitor import Monitor
 from federatedscope.core.trainers.context import CtxVar
@@ -44,14 +47,18 @@ class EarlyStopper:
         """
         在每次评估后调用此方法，检查本地早停条件。
         """
+        is_invalid_score = current_score is None or np.isnan(current_score) or np.isinf(current_score)
+
         if self.best_score is None:
             self.best_score = current_score
             self.save_checkpoint(engine)
+            return
         
-        elif current_score > self.best_score + self.delta:
+        if is_invalid_score or current_score > self.best_score + self.delta:
             # 性能变差了
             self.counter += 1
-            logger.info(f"[EarlyStopper] No improvement. Counter: {self.counter} / {self.patience}")
+            status = "invalid (NaN/Inf)" if is_invalid_score else "no improvement"
+            logger.info(f"[EarlyStopper] Score is {status}. Counter: {self.counter} / {self.patience}")
             if self.counter >= self.patience:
                 self.early_stop = True
         else:
@@ -91,6 +98,117 @@ class EarlyStopException(Exception):
     pass
 
 
+class PerformanceMonitor:
+    def __init__(self, device):
+        self.device = device
+        self.start_time = 0.0
+        self.end_time = 0.0
+        
+        # 追踪 CPU 内存 (RAM)
+        self.process = psutil.Process(os.getpid())
+        self.cpu_mem_usage_peak = 0.0 # 单位: MB
+
+        # 追踪 GPU 显存 (VRAM)
+        self.gpu_mem_allocated_peak = 0.0 # 单位: MB
+        self.gpu_mem_reserved_peak = 0.0  # 单位: MB
+
+    def _is_cuda(self):
+        """一个辅助函数，用于判断是否在使用 CUDA。"""
+        if not torch.cuda.is_available():
+            return False
+        if isinstance(self.device, torch.device):
+            return self.device.type == 'cuda'
+        elif isinstance(self.device, str):
+            return 'cuda' in self.device
+        elif isinstance(self.device, int):
+            return self.device >= 0 # 假设非负整数代表 GPU ID
+        return False
+
+    def start(self):
+        """开始计时和监控。"""
+        # 使用辅助函数进行判断
+        if self._is_cuda():
+            torch.cuda.reset_peak_memory_stats(self.device)
+        
+        self.start_time = time.time()
+        logger.info("Performance monitor started.")
+        
+    def stop(self):
+        """停止计时，收集峰值数据，并打印报告。"""
+        self.end_time = time.time()
+        
+        # 收集峰值数据
+        self.cpu_mem_usage_peak = self.process.memory_info().rss / (1024 ** 2)
+        
+        if self._is_cuda():
+            stats = torch.cuda.memory_stats(self.device)
+            self.gpu_mem_allocated_peak = stats["allocated_bytes.all.peak"] / (1024 ** 2)
+            self.gpu_mem_reserved_peak = stats["reserved_bytes.all.peak"] / (1024 ** 2)
+
+        self.report()
+
+    def report(self):
+        """打印性能报告。"""
+        total_seconds = self.end_time - self.start_time
+        total_minutes = total_seconds / 60.0
+
+        logger.info("----------- Performance Report -----------")
+        logger.info(f"  - Total Training Time: {total_minutes:.2f} minutes ({total_seconds:.2f} seconds)")
+        logger.info(f"  - CPU Memory Peak Usage (RSS): {self.cpu_mem_usage_peak:.2f} MB")
+        
+        if self._is_cuda():
+            logger.info(f"  - GPU Memory Peak Allocated: {self.gpu_mem_allocated_peak:.2f} MB")
+            logger.info(f"  - GPU Memory Peak Reserved: {self.gpu_mem_reserved_peak:.2f} MB")
+        else:
+            logger.info("  - GPU Monitoring: Not available (CUDA not found or not used).")
+        logger.info("------------------------------------------")
+
+
+class AggregationTimer:
+    """
+    一个用于精确测量并累加总聚合时间的类。
+    支持手动 start/stop 和作为上下文管理器使用。
+    """
+    def __init__(self):
+        self._total_aggregation_time = 0.0
+        self._start_time = 0.0
+        self._is_running = False # 新增：标记计时器是否正在运行
+
+    def start(self):
+        """手动开始计时。"""
+        if not self._is_running:
+            self._start_time = time.perf_counter()
+            self._is_running = True
+
+    def stop(self):
+        """手动停止计时并累加时间。"""
+        if self._is_running:
+            end_time = time.perf_counter()
+            self._total_aggregation_time += (end_time - self._start_time)
+            self._is_running = False
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
+
+    def reset(self):
+        self._total_aggregation_time = 0.0
+        self._is_running = False
+
+    @property
+    def total_seconds(self):
+        return self._total_aggregation_time
+
+    def report(self):
+        """打印最终的聚合时间报告。"""
+        logger.info(f"----------- Aggregation Time Report -----------")
+        logger.info(f"  - Total Time Spent in Aggregation: {self.total_seconds:.4f} seconds")
+        logger.info("---------------------------------------------------------")
+
+
 class FedSpeedTrainer(LLMTrainer):
     def __init__(self, model, data, device, config, **kwargs):
         super().__init__(model, data, device, config, **kwargs)
@@ -105,6 +223,8 @@ class FedSpeedTrainer(LLMTrainer):
         self.router = None
         self.internal_message_queue = queue.Queue()
         self.comm_executor = None
+        self.monitor = PerformanceMonitor(device)
+        self.aggregation_timer = AggregationTimer()
 
         self.aggregation_mode = self.config.federate.get('aggregation_mode') 
         self.is_decentralized_sharded_mode = (self.aggregation_mode == 'shardedGradient')
@@ -130,6 +250,51 @@ class FedSpeedTrainer(LLMTrainer):
             self.global_early_stop_votes = {}
         else:
             self.early_stopper = None
+
+    def _run_batch(self, hooks_set, run_step=-1):
+        """
+        重写父类的 _run_batch 方法，以支持在跳过 NaN batch 时，
+        不计入总 step 数，并从 data_loader 中获取新的 batch 来补偿。
+        """
+        if run_step == -1:
+            run_step = getattr(self.ctx, f"num_{self.ctx.cur_split}_batch")
+
+        # 确保 dataloader 是可重新迭代的
+        if not isinstance(self.ctx.get(f'{self.ctx.cur_split}_loader'), ReIterator):
+             self.ctx[f'{self.ctx.cur_split}_loader'] = ReIterator(self.ctx.get(f'{self.ctx.cur_split}_loader'))
+        
+        # 使用 while 循环，由我们自己的有效 step 计数器 self.current_step 控制
+        while self.current_step < run_step:
+            try:
+                # 在 on_batch_start 之前获取数据
+                for hook in hooks_set["on_batch_start"]:
+                    hook(self.ctx)
+
+                for hook in hooks_set["on_batch_forward"]:
+                    hook(self.ctx)
+
+                # 检查在 on_batch_forward 中是否设置了跳过标志
+                if getattr(self.ctx, 'skip_this_batch', False):
+                    logger.warning(
+                        f"[Step Drift Prevented] Batch resulted in NaN. "
+                        f"Skipping backward/end hooks and fetching a new batch. "
+                        f"Effective step count remains {self.current_step}."
+                    )
+                    # 直接进入下一次 while 循环，获取新数据
+                    # self.current_step 不会增加
+                    continue 
+
+                for hook in hooks_set["on_batch_backward"]:
+                    hook(self.ctx)
+
+                for hook in hooks_set["on_batch_end"]:
+                    hook(self.ctx)
+
+            except StopIteration:
+                # 数据加载器已经耗尽
+                logger.warning("Dataloader exhausted before reaching target steps. "
+                               f"Completed {self.current_step}/{run_step} effective steps.")
+                break # 退出 while 循环
 
     def _hook_on_fit_start_init(self, ctx):
         super()._hook_on_fit_start_init(ctx)
@@ -177,6 +342,8 @@ class FedSpeedTrainer(LLMTrainer):
             # 在所有训练开始前，启动 Reconstructor 的后台线程
             if self.fedspeed_engine and self.fedspeed_engine.reconstructor:
                 self.fedspeed_engine.reconstructor.start()
+            self.fedspeed_engine.aggregation_timer = self.aggregation_timer
+            self.monitor.start()
 
     # 将所有复杂逻辑都委托给 Engine
     def _hook_on_batch_forward(self, ctx):
@@ -189,15 +356,27 @@ class FedSpeedTrainer(LLMTrainer):
         log_memory_usage("Forward End")
         
         # 将结果保存到 ctx 中
-        #    假设模型在训练时返回了loss（当提供了labels时）
         if hasattr(outputs, 'loss') and outputs.loss is not None:
-            ctx.loss_batch = CtxVar(outputs.loss, "batch")
-            ctx.loss_task = CtxVar(outputs.loss, "batch") # 简化
-            ctx.skip_this_batch = CtxVar(False, "batch")
+            # 检查 loss 是否为 NaN
+            if torch.isnan(outputs.loss):
+                ctx.skip_this_batch = CtxVar(True, "batch")
+                logger.warning(
+                    f"[Step {self.current_step}] Loss is NaN. Skipping this batch. "
+                )
+                # 即使跳过，也要为下游钩子提供一个默认的零值loss
+                ctx.loss_batch = CtxVar(torch.tensor(0.0, device=ctx.device), "batch")
+                ctx.loss_task = CtxVar(torch.tensor(0.0, device=ctx.device), "batch")
+            else:
+                ctx.skip_this_batch = CtxVar(False, "batch")
+                ctx.loss_batch = CtxVar(outputs.loss, "batch")
+                ctx.loss_task = CtxVar(outputs.loss, "batch") # 简化
         else:
             # 处理推理或未提供label的情况
-            ctx.skip_this_batch = CtxVar(True, "batch")
-            logger.warning("No loss returned from model forward pass. Skipping backward.")
+            ctx.skip_this_batch = CtxVar(True, "batch")           
+            ctx.loss_batch = CtxVar(torch.tensor(0.0, device=ctx.device), "batch")
+            ctx.loss_task = CtxVar(torch.tensor(0.0, device=ctx.device), "batch")
+            if ctx.cur_mode == MODE.TRAIN: # 只在训练模式下打印警告
+                 logger.warning("No loss returned from model forward pass. Skipping backward.")
         
         # ... 其他 ctx 变量的赋值，例如 logits
         if hasattr(outputs, 'logits'):
@@ -223,7 +402,6 @@ class FedSpeedTrainer(LLMTrainer):
                 self.fedspeed_engine.temp_full_gradients.clear()
             return
         self.current_step += 1
-        self.fedspeed_engine.current_step += 1
 
         # --- 检查是否需要阶段转换 ---
         if self.fedspeed_engine.noniid and self.current_step == self.stage_one_steps:
@@ -232,12 +410,13 @@ class FedSpeedTrainer(LLMTrainer):
         # 通用异步逻辑 (消息处理)
         logger.debug(f"process_incoming_messages")
         # if self.asynchronous:
-        self.process_incoming_messages()    
+        self.aggregation_timer.start()
+        self.process_incoming_messages()   
+        self.aggregation_timer.stop() 
 
         # 梯度分片处理流程
         if self.is_decentralized_sharded_mode:
-            self.fedspeed_engine.current_step += 1
-            
+            self.fedspeed_engine.current_step = self.current_step
             # 1. 处理本地计算的梯度：保留自己的分片，准备并匿名发送其他人的分片
             logger.debug(f"process_and_dispatch_gradients")
             my_local_grad_shards, grouped_shards_to_dispatch = self.fedspeed_engine.process_and_dispatch_gradients()
@@ -245,21 +424,25 @@ class FedSpeedTrainer(LLMTrainer):
             # 2. 匿名发送梯度分片
             if grouped_shards_to_dispatch:
                 logger.debug(f"send_gradient_shard_anonymously")
+                self.aggregation_timer.start()
                 for target_client_id, shard_list in grouped_shards_to_dispatch.items():
                     if shard_list: # 确保列表不为空
                         self.send_gradient_shards_anonymously_packaged(
                             shard_list, # 发送整个列表
                             target_client_id
                         )
+                self.aggregation_timer.stop()
 
             # 3. 执行优化器步骤 (内部包含梯度 FedAvg 聚合)
             logger.debug(f"sharded_step")
             updated_shards_for_broadcast, model_was_updated_by_peers = self.fedspeed_engine.sharded_step(my_local_grad_shards)
 
             # 4. 异步推送更新后的参数分片 (非匿名)
-            if model_was_updated_by_peers and self.fedspeed_engine.current_step > self.fedspeed_engine.stage_one_steps:
+            if model_was_updated_by_peers and not self.fedspeed_engine.is_in_stage_one:
                 logger.debug(f"broadcast_shard_updates")
+                self.aggregation_timer.start()
                 self.broadcast_shard_updates(updated_shards_for_broadcast)
+                self.aggregation_timer.stop()
 
         else:
             # 常规流程
@@ -275,22 +458,28 @@ class FedSpeedTrainer(LLMTrainer):
 
             # 3. 通信
             if params_to_send is not None:
+                self.aggregation_timer.start()
                 self._send_data(params_to_send)
-
+                
                 # 4. 等待并处理同步消息
                 if self.aggregation_mode == 'fl-sim':
                     message = self.comm_manager.receive()
                     if message.msg_type == 'aggregated_model_para':
                         self.handle_model(message)
 
+                self.aggregation_timer.stop()
+
         # 日志和评估
         my_rank = dist.get_rank()
         logger.info(f"--- Rank {my_rank} | Step {self.current_step} | Loss: {ctx.loss_batch.item():.4f} ---")
         ctx.num_samples += ctx.batch_size
         ctx.loss_batch_total += ctx.loss_batch.item() * ctx.batch_size
-        stage_one_steps = self.cfg.federate.get('stage_one_steps', 0)
-        if self.eval_freq > 0 and (self.current_step % self.eval_freq) == 0 and self.current_step > stage_one_steps:
+        if self.eval_freq > 0 and (self.current_step % self.eval_freq) == 0 and not self.fedspeed_engine.is_in_stage_one:
             self.evaluation()
+
+        # 回收显存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # 在每一步结束时，检查全局共识
         if self.early_stopper:
@@ -298,6 +487,7 @@ class FedSpeedTrainer(LLMTrainer):
                 
     def _hook_on_fit_end(self, ctx):
         # --- 首先调用原有的 _hook_on_fit_end ---
+        self.aggregation_timer.report()
         super()._hook_on_fit_end(ctx)
         # 在所有训练结束后，安全地停止 Reconstructor 的后台线程
         if self.fedspeed_engine and self.fedspeed_engine.reconstructor:
@@ -421,7 +611,6 @@ class FedSpeedTrainer(LLMTrainer):
         if not self.router:
             logger.error("Anonymous routing is enabled, but the router is not initialized.")
             return
-
         # --- 1. 手动将 Tensor 序列化为 bytes ---
         # 我们对原始的 shard_list 进行就地修改
         for content_dict in shard_list:
@@ -621,6 +810,7 @@ class FedSpeedTrainer(LLMTrainer):
 
         action, data = result
         if action == 'aggregate':
+            logger.debug("recieve aggregate message")
             # 梯度分片
             if self.is_decentralized_sharded_mode:
                 decrypted_content = data['content']
@@ -640,6 +830,7 @@ class FedSpeedTrainer(LLMTrainer):
                 decrypted_params_vec = pickle.loads(pickled_bytes)
                 self._handle_incoming_model_vec(decrypted_params_vec.to(self.ctx.device), data['state'])
         elif action == 'forward':
+            logger.debug("recieve forward message")
             # b. Router 说我是中继，需要转发
             self.comm_manager.send(
                 Message(msg_type='anonymous_forward',
@@ -682,7 +873,7 @@ class FedSpeedTrainer(LLMTrainer):
         """
         if not (hasattr(self, 'fedspeed_engine') and self.fedspeed_engine):
             return
-        logger.info(f"--- [FedSpeed-Model] Aggregating at Step #{self.current_step} ---")
+        logger.debug(f"--- [FedSpeed-Model] Aggregating at Step #{self.current_step} ---")
             
         # 异步模式下，计算自适应权重
         if self.asynchronous and self.aggregation_mode != "fs-sim":
@@ -711,6 +902,10 @@ class FedSpeedTrainer(LLMTrainer):
         func_type = self.adaptive_weight_cfg.get('type', 'constant')
         if func_type == 'exponential':
             decay_rate = self.adaptive_weight_cfg.get('decay_rate', 0.9)
+            logger.debug(
+            f"[AdaptiveWeight] current_step={self.current_step}, received_step={received_step}, "
+            f"calculated_alpha={initial_alpha * (decay_rate ** staleness):.4f}"
+        )
             return initial_alpha * (decay_rate ** staleness)
         elif func_type == 'linear':
             decay_factor = self.adaptive_weight_cfg.get('decay_factor', 0.01)
@@ -750,45 +945,70 @@ class FedSpeedTrainer(LLMTrainer):
             # b. 前向传播计算loss
             total_loss = 0.0
             total_samples = 0
+            nan_batches = 0 # <-- 新增：记录 NaN batch 的数量
+
             with torch.no_grad():
-                for _ in range(self.num_batches):
+                for i in range(self.num_batches):
                     try:
-                        # i. 准备 batch 数据
                         batch_data = next(dataloader)
-                        ctx = self.ctx # 复用 trainer 的上下文
                         ctx.data_batch = batch_data
                         
-                        # ii. 执行前向传播
                         data_batch_on_device = {k: v.to(ctx.device) for k, v in ctx.data_batch.items()}
-                        # Engine 的 forward 逻辑 (包括 hooks) 会自动处理参数重建
                         outputs = self.fedspeed_engine.forward(**data_batch_on_device)
                         
                         if hasattr(outputs, 'loss') and outputs.loss is not None:
+                            # --- 关键修复 2: 在评估循环内部检查并跳过 NaN loss ---
+                            if torch.isnan(outputs.loss) or torch.isinf(outputs.loss):
+                                nan_batches += 1
+                                logger.warning(
+                                    f"[Evaluation] Loss is NaN/Inf on batch {i+1}/{self.num_batches}. Skipping this batch."
+                                )
+                                continue # 跳过这个batch，不计入 total_loss
+                            # --- 结束修复 2 ---
+                            
                             batch_loss = outputs.loss.item()
                             batch_size = data_batch_on_device['input_ids'].size(0)
                             total_loss += batch_loss * batch_size
                             total_samples += batch_size
                     except StopIteration:
-                        # 正常情况下不应发生，但作为保护
                         break
+            
+            # 报告 NaN batch 的情况
+            if nan_batches > 0:
+                logger.warning(
+                    f"[Evaluation] Encountered and skipped {nan_batches} batches with NaN/Inf loss "
+                    f"out of {self.num_batches} total batches in the validation set."
+                )
+
+            # 即使所有batch都是NaN，也要避免除以零
+            if total_samples == 0:
+                # 如果所有batch都被跳过了，avg_loss 应该是 NaN 或 inf，
+                # 这样 EarlyStopper 就能正确地将其识别为一次失败的评估。
+                avg_loss = float('nan') 
+            else:
+                avg_loss = total_loss / total_samples
+
+            eval_results = {
+                f'{split}_avg_loss': avg_loss,
+                f'{split}_total': total_samples,
+                f'{split}_nan_batches': nan_batches # <-- 新增：在结果中也记录下来
+            }
+            logger.info(f"  - Evaluation results on '{split}': {eval_results}")
+
+            if self.early_stopper:
+                # --- 关键修复 3: 将 NaN loss 传递给 EarlyStopper ---
+                # EarlyStopper 需要能够处理 NaN 值，将其视为最差表现
+                score_to_check = avg_loss
+                if score_to_check is None or np.isnan(score_to_check) or np.isinf(score_to_check):
+                    # 如果 avg_loss 是无效值, 我们给一个很大的惩罚值，确保它不会被认为是最佳分数
+                    # 或者让 EarlyStopper 内部处理它
+                    pass # 让 EarlyStopper 接收 NaN
                 
-                # c. 计算全局平均损失
-                avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
-
-                # d. 打印评估结果
-                eval_results = {
-                    f'{split}_avg_loss': avg_loss,
-                    f'{split}_total': total_samples,
-                }
-                logger.info(f"  - Evaluation results on '{split}': {eval_results}")
-
-                # e. 判断是否早停
-                if self.early_stopper:
-                    self.early_stopper(avg_loss, self.fedspeed_engine)
-                    if self.early_stopper.early_stop and not self.global_early_stop_votes[self.client_id]:
-                        # 广播早停投票
-                        logger.info(f"--- [Client {self.client_id}] local early stop condition TRIGGERED! Broadcast vote. ---")
-                        self.broadcast_early_stop_vote()
+                self.early_stopper(score_to_check, self.fedspeed_engine)
+                if self.early_stopper.early_stop and not self.global_early_stop_votes[self.client_id]:
+                    # 广播早停投票
+                    logger.info(f"--- [Client {self.client_id}] local early stop condition TRIGGERED! Broadcast vote. ---")
+                    self.broadcast_early_stop_vote()
         else:
             logger.warning(f"Dataloader for split '{split}' not found in trainer or ctx. Skipping evaluation.")
 
@@ -796,7 +1016,7 @@ class FedSpeedTrainer(LLMTrainer):
         if is_training_mode:
             self.ctx.model.train()
 
-    def initialize_router(self, client_id, peers):
+    def initialize_router(self, client_id):
         """
         一个由 Client 调用的、专门用于初始化 Router 的方法。
         """

@@ -5,13 +5,13 @@ early_stop:
 federate:
   method: fedspeed
   aggregation_mode: 'shardedGradient'
-  aggregation_steps: 20
+  aggregation_steps: 1
   asynchronous_aggregation: True
-  anonymous_routing: False
+  anonymous_routing: True
   use_activation_checkpointing: True
   mode: distributed
   client_num: 4
-  save_to: "gpt2_alpaca.ckpt"
+  save_to: "./saved_models/gpt2_alpaca.ckpt"
   model_cache_path: './model_cache/'
   use_offline_model: True
   gpu_mem_pressure_threshold: 0.8
@@ -19,20 +19,20 @@ federate:
   prefetch_depth: 12
   transformer_block_class_name: 'GPT2Block'
   two_stages: 
-    use: True
-    stage_one_steps: 100
-    noniid: True
+    use: False
+    stage_one_steps: 600
+    noniid: False
     group_num: 2
   adaptive_weight:
     use: True
     type: 'exponential'
-    decay_rate: 0.9
+    decay_rate: 0.95
   gossip_num: -1
 data:
   root: data/
-  type: 'rosetta_alpaca@llm'
-  splits: [0.98,0.01,0.01]
-  splitter: 'grouped'
+  type: 'gsm8k@llm'
+  splits: [0.9,0.1,0]
+  splitter: 'iid'
   splitter_args: [ 
     {
       num_groups: 2,
@@ -42,9 +42,9 @@ data:
   ]
 distribute:
   use: True
-  server_host: '127.0.0.1'
+  server_host: '10.214.151.191'
   server_port: 50051
-  client_host: '127.0.0.1'
+  client_host: '10.214.151.190'
   client_port: 50055
   role: 'client'
   data_idx: 4
@@ -82,6 +82,6 @@ criterion:
 trainer:
   type: fedspeedtrainer
 eval:
-  freq: 40
+  freq: 50
   metrics: ['loss']
   count_flops: False

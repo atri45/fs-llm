@@ -1,20 +1,27 @@
 use_gpu: True
 device: 0
 early_stop:
-  patience: 10
+  patience: 0
 federate:
-  mode: standalone
-  client_num: 1
-  total_round_num: 100
-  save_to: "gpt2_rosetta_alpaca_lda.ckpt"
-  share_local_model: False
-  online_aggr: False
+  mode: distributed
+  client_num: 4
+  total_round_num: 250
+  save_to: "gpt2_new.ckpt"
 data:
   root: data/
   type: 'rosetta_alpaca@llm'
-  splits: [0.98,0.01,0.01]
-  splitter: 'lda'
-  splitter_args: [{'alpha': 0.05}]
+  splits: [0.9,0.1,0]
+  splitter: 'iid'
+distribute:
+  use: True
+  server_host: '10.214.151.191'
+  server_port: 50051
+  client_host: '10.214.151.192'
+  client_port: 50055
+  role: 'client'
+  data_idx: 4
+  grpc_max_send_message_length: 1048576000
+  grpc_max_receive_message_length: 1048576000
 llm:
   tok_len: 1000
   chat:
@@ -23,22 +30,27 @@ llm:
     use: True
     args: [ { 'adapter_package': 'peft', 'adapter_method': 'lora', 'r': 8, 'lora_alpha': 32, 'lora_dropout': 0.1 } ]
   deepspeed:
-    use: True
+    use: False
     ds_config: 'federatedscope/llm/baseline/deepspeed/ds_config.json'
+  offsite_tuning:
+    use: False
+    emu_l: 2
+    emu_r: 30
 dataloader:
-  batch_size: 4
+  batch_size: 2
 model:
   type: 'gpt2@huggingface_llm'
 train:
-  local_update_steps: 10
+  local_update_steps: 25
   batch_or_epoch: batch
   optimizer:
     lr: 0.001
+    weight_decay: 0.0
 criterion:
   type: CrossEntropyLoss
 trainer:
   type: llmtrainer
 eval:
-  freq: 10
+  freq: 2
   metrics: ['loss']
   count_flops: False

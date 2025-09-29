@@ -1,5 +1,9 @@
 from federatedscope.core.data.utils import filter_dict
-
+try:
+    from federatedscope.llm.dataloader import get_tokenizer, LLMDataCollator
+    _llm_dependencies_available = True
+except ImportError:
+    _llm_dependencies_available = False
 try:
     import torch
     from torch.utils.data import Dataset
@@ -85,11 +89,20 @@ def get_dataloader(dataset, config, split='train'):
     filtered_args = filter_dict(loader_cls.__init__, raw_args)
 
     if config.data.type.lower().endswith('@llm'):
-        from federatedscope.llm.dataloader import get_tokenizer, \
-            LLMDataCollator
+        if not _llm_dependencies_available:
+            raise ImportError("LLM dependencies not found, but data type is LLM.")
+        
+        # This get_tokenizer call will now be extremely fast after the first time
+        # due to the cache we added in dataloader.py
         model_name, model_hub = config.model.type.split('@')
         tokenizer, _ = get_tokenizer(model_name, config.data.root,
                                      config.llm.tok_len, model_hub)
+        
+        # We need to set pad_token_id for the collator to work correctly
+        # if the tokenizer initially didn't have one.
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+
         data_collator = LLMDataCollator(tokenizer=tokenizer)
         filtered_args['collate_fn'] = data_collator
 

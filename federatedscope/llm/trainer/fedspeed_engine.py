@@ -18,19 +18,21 @@ from torch.nn.utils import clip_grad_norm_
 logger = logging.getLogger(__name__)
 
 class PipelinedReconstructor:
-    def __init__(self, engine, name_to_param_map):
+    def __init__(self, engine, name_to_param_map, sanitized_model_name: str):
         self.engine = engine
         self.rank = engine.rank
         self.device = engine.device
         self.name_to_param_map = name_to_param_map
         self.param_name_to_exec_idx = {}
         self.direction = 'forward'
+        self.sanitized_model_name = sanitized_model_name
 
         # --- 配置 ---
         self.cache_path = engine.cfg.federate.get('model_cache_path')
         self.prefetch_depth = engine.cfg.federate.get('prefetch_depth', 2)
         self.gpu_mem_pressure_threshold = engine.cfg.federate.get('gpu_mem_pressure_threshold', 0.9)
         self.cpu_mem_pressure_threshold = engine.cfg.federate.get('cpu_mem_pressure_threshold', 0.9)
+        self.model_specific_cache_path = os.path.join(self.cache_path, self.sanitized_model_name)
 
         if not self.cache_path:
             raise ValueError("`fedspeed.model_cache_path` must be specified.")
@@ -74,7 +76,7 @@ class PipelinedReconstructor:
             key_to_find = key_to_find[len("base_model.model."):]
         if key_to_find.startswith("model."):
             key_to_find = key_to_find[len("model."):]
-        file_path = os.path.join(self.cache_path, key_to_find + ".npy")
+        file_path = os.path.join(self.model_specific_cache_path, key_to_find + ".npy")
         if not os.path.exists(file_path):
             logger.warning(f"Parameter file not found: {file_path}")
             return None
@@ -303,6 +305,8 @@ class FedSpeedEngine:
         self._execution_order_built = False
         self._execution_order = []
         self._module_to_exec_idx = {}
+        self.aggregation_timer = None
+        self.sanitized_model_name = _sanitize_model_name_for_path(self.cfg.model.type)
 
         # 状态
         self.aggregation_mode = self.cfg.federate.get('aggregation_mode', 'local-reconstruct')
@@ -312,6 +316,7 @@ class FedSpeedEngine:
         self.two_stage = self.cfg.federate.two_stages.get('use', False)
         self.stage_one_steps = self.cfg.federate.two_stages.get('stage_one_steps', 250)
         self.noniid = self.cfg.federate.two_stages.get('noniid', False)
+        self.adaptive_weight_cfg = self.cfg.federate.get('adaptive_weight', {'use': False})
         self.is_in_stage_one = self.two_stage
         self.local_trainable_names_stage1 = None
         self.should_aggregate = False
@@ -391,19 +396,20 @@ class FedSpeedEngine:
 
     def _initialize_from_full_state_dict(self, state_dict: dict):
         """
-        【新重构函数】处理所有需要从完整 state_dict 初始化的通用逻辑。
+        处理所有需要从完整 state_dict 初始化的通用逻辑。
         包括创建 Reconstructor、填充 CPU 缓存以及构建执行顺序。
         """
         logger.info(f"Initializing engine from a full state_dict for mode '{self.aggregation_mode}'.")
 
         # 1. 创建 PipelinedReconstructor
-        self.reconstructor = PipelinedReconstructor(self, self.name_to_param_map)
+        self.reconstructor = PipelinedReconstructor(self, self.name_to_param_map, self.sanitized_model_name)
 
         if self.use_offline_model:
             # --- 离线模式：从本地磁盘缓存加载 ---
             logger.info("use_offline_model=True. Priming CPU cache from local disk cache...")
-            if not self.local_cache_path or not os.path.exists(self.local_cache_path):
-                raise FileNotFoundError(f"use_offline_model is True, but the model_cache_path '{self.local_cache_path}' does not exist.")
+            model_specific_cache_path = os.path.join(self.local_cache_path, self.sanitized_model_name)
+            if not model_specific_cache_path or not os.path.exists(model_specific_cache_path):
+                raise FileNotFoundError(f"use_offline_model is True, but the model_cache_path '{model_specific_cache_path}' does not exist.")
             
             offline_state_dict = {}
             # 遍历模型的所有参数，尝试从缓存路径加载它们
@@ -481,7 +487,8 @@ class FedSpeedEngine:
         if not self.local_cache_path:
             raise ValueError("`fedspeed.model_cache_path` must be specified for local-reconstruct mode.")
         
-        done_file = os.path.join(self.local_cache_path, ".creation_done")
+        model_specific_cache_path = os.path.join(self.local_cache_path, self.sanitized_model_name)
+        done_file = os.path.join(model_specific_cache_path, ".creation_done")
         if os.path.exists(done_file):
             logger.info(f"Rank {self.rank}: Layer-wise cache already exists at {self.local_cache_path}")
             return
@@ -502,7 +509,7 @@ class FedSpeedEngine:
             if key_in_state_dict in state_dict:
                 param_data_to_save = state_dict[key_in_state_dict]
                 param_filename = key_in_state_dict + ".npy"
-                full_path = os.path.join(self.local_cache_path, param_filename)
+                full_path = os.path.join(model_specific_cache_path, param_filename)
                 os.makedirs(os.path.dirname(full_path), exist_ok=True)
                 # 将 PyTorch 张量转换为 NumPy 数组
                 numpy_array = param_data_to_save.cpu().numpy()
@@ -909,8 +916,8 @@ class FedSpeedEngine:
         logger.debug(f"[POST-FWD HOOK @ Rank {self.rank}] For {type(module).__name__}")
 
         # 1. 参数释放
-        if self.aggregation_mode == 'model':
-            self._release_all_full_params()
+        # if self.aggregation_mode == 'model':
+        #     self._release_all_full_params()
         if self.aggregation_mode == 'gradient':
             param_ids_in_module = self.module_to_params_map.get(id(module), [])
             current_ref_counter = self.param_recompute_ref_count if self.is_recomputing else self.param_fwd_ref_count
@@ -986,8 +993,8 @@ class FedSpeedEngine:
         logger.debug(f"[POST-BWD HOOK @ Rank {self.rank}] For {type(module).__name__}")
 
         # 1. 参数释放
-        if self.aggregation_mode == 'model':
-            self._release_all_full_params()
+        # if self.aggregation_mode == 'model':
+        #     self._release_all_full_params()
         if self.aggregation_mode == 'gradient':
             param_ids_in_module = self.module_to_params_map.get(id(module), [])
             current_ref_counter = self.param_recompute_ref_count if self.is_recomputing else self.param_bwd_ref_count
@@ -1155,6 +1162,7 @@ class FedSpeedEngine:
         if self.two_stage:
             if self.current_step == self.stage_one_steps:
                 # 阶段转换点，强制聚合
+                self.is_in_stage_one = False
                 self.should_aggregate = True
                 logger.info(f"--- [Stage Transition] Step #{self.current_step} ---")
             elif self.current_step > self.stage_one_steps and self.current_step % self.aggregation_steps == 0:
@@ -1167,9 +1175,11 @@ class FedSpeedEngine:
         
         # 返回要发送的参数
         if self.should_aggregate:
+            self.aggregation_timer.start()
             trainable_params = self.local_optimizer.param_groups[0]['params']
             params_to_send_vec = parameters_to_vector([p.data for p in trainable_params]).clone()
-
+            self.aggregation_timer.stop()
+            
             # 清理未使用的缓存内存
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -1268,7 +1278,8 @@ class FedSpeedEngine:
                  self.should_aggregate = True
                  logger.info(f"--- [FedSpeed-Model] Aggregating at Step #{self.current_step} ---")
 
-        if self.should_aggregate:            
+        if self.should_aggregate:      
+            self.aggregation_timer.start()      
             # a. 将本地更新后的【完整】可训练参数打包成一个向量
             trainable_params_in_order = self.local_optimizer.param_groups[0]['params']
             updated_local_full_params_vec = parameters_to_vector(
@@ -1285,6 +1296,8 @@ class FedSpeedEngine:
 
             # 聚合后重置优化器
             # self._initialize_for_model_aggregation()
+
+            self.aggregation_timer.stop()
 
         # 3. 清理未使用的缓存内存
         if torch.cuda.is_available():
@@ -1311,9 +1324,11 @@ class FedSpeedEngine:
         self.should_aggregate = False
         if self.current_step % self.aggregation_steps == 0:
             self.should_aggregate = True
+            self.aggregation_timer.start()
             trainable_params = self.local_optimizer.param_groups[0]['params']
             params_to_send_vec = parameters_to_vector([p.data for p in trainable_params]).clone()
-
+            self.aggregation_timer.stop()
+            
             # 清理未使用的缓存内存
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -1338,13 +1353,12 @@ class FedSpeedEngine:
 
         # --- 阶段一：层聚合与梯度掩码 ---
         if self.noniid and self.is_in_stage_one:
-            
             # 1. 聚合收到的层梯度 (FedAvg)
             all_grads_for_update = {name: [] for name in self.ordered_trainable_names}
             
             # a. 加入自己本地计算的梯度
             for name, grad in my_local_grad_shards.items():
-                all_grads_for_update[name].append(grad)
+                all_grads_for_update[name].append((grad, self.current_step))
 
             # b. 从缓冲区中加入接收到的梯度
             for name, received_shards in self.grad_shard_buffer.items():
@@ -1362,17 +1376,33 @@ class FedSpeedEngine:
                         param_shard_view.grad = torch.zeros_like(param_shard_view.data)
                         continue
                     
-                    # 属于我，进行聚合
-                    grad_list = all_grads_for_update.get(param_name, [])
-                    if not grad_list:
-                        logger.warning(f"[Stage 1] No gradient found for my layer param '{param_name}'. Setting grad to zero.")
+                    grad_tuples = all_grads_for_update.get(param_name, [])
+                    if not grad_tuples:
                         param_shard_view.grad = torch.zeros_like(param_shard_view.data)
                         continue
                     
-                    # 执行 FedAvg
-                    avg_grad = torch.stack(grad_list).mean(dim=0)
+                    self.aggregation_timer.start()
+                    num_grads_to_agg = len(grad_tuples)
+                    grad_steps = [t[1] for t in grad_tuples]
+                    logger.debug(
+                        f"[Stage 1 Aggregation] Param '{param_name[:30]}...': "
+                        f"Aggregating {num_grads_to_agg} grads from steps: {grad_steps}"
+                    )
+
+                    # --- 在阶段一执行加权平均 ---
+                    weighted_grad_sum = torch.zeros_like(grad_tuples[0][0], device=self.device)
+                    total_weight = 0.0
+                    for grad, r_step in grad_tuples:
+                        alpha = self._calculate_adaptive_alpha(r_step)
+                        weighted_grad_sum.add_(grad.to(self.device), alpha=alpha)
+                        total_weight += alpha
                     
-                    # 【重要】平均后的梯度是完整的，需要切分出我的分片
+                    if total_weight > 1e-6:
+                        avg_grad = weighted_grad_sum / total_weight
+                    else:
+                        avg_grad = torch.zeros_like(param_shard_view.data)
+
+                    # 阶段一的梯度是完整的，需要切分出我的分片
                     sharding_info = self.sharding_metadata[param_name]
                     my_rank_info = sharding_info['ranks_info'][self.rank]
                     offset, size = my_rank_info['offset'], my_rank_info['size']
@@ -1380,16 +1410,22 @@ class FedSpeedEngine:
                     avg_grad_shard = avg_grad.narrow(sharding_info['split_dim'], offset, size)
                     param_shard_view.grad = avg_grad_shard.to(self.device)
 
+                    self.aggregation_timer.stop()
+
                     # d. 清理缓冲区
                     if param_name in self.grad_shard_buffer:
                         self.grad_shard_buffer[param_name] = []
 
-            # 3. 更新模型
-            self.local_optimizer.step()
-            self.local_optimizer.zero_grad()
+                # 3. 更新模型
+                # # 梯度裁剪
+                # params_with_grad = [p for p in self.local_optimizer.param_groups[0]['params'] if p.grad is not None]
+                # if params_with_grad:
+                #     clip_grad_norm_(params_with_grad, max_norm=1.0)
+                self.local_optimizer.step()
+                self.local_optimizer.zero_grad()
 
-            # 阶段一不广播参数，返回空值
-            return [], False
+                # 阶段一不广播参数，返回空值
+                return [], False
 
         # --- 阶段二 或 非分组模式：按参数分片更新 (你已有的逻辑) ---
         else:
@@ -1405,45 +1441,68 @@ class FedSpeedEngine:
                 # a. 获取本地计算出的梯度分片
                 local_grad_shard = my_local_grad_shards.get(param_name)
                 if local_grad_shard is None:
-                    logger.warning(f"Local grad shard for '{param_name}' not found. Skipping update.")
-                    continue
+                    # 只有在缓冲区也没有梯度时才跳过
+                    if not self.grad_shard_buffer.get(param_name, []):
+                        logger.warning(f"No local or remote grad shard for '{param_name}'. Skipping update.")
+                        continue
+                    # 如果只有远程梯度，创建一个零张量作为本地梯度
+                    local_grad_shard = torch.zeros_like(param_shard_view.data)
                     
                 # b. 获取从网络接收的梯度分片
-                received_grad_shards = self.grad_shard_buffer.get(param_name, [])
+                received_grad_tuples = self.grad_shard_buffer.get(param_name, [])
                 
                 # c. 将所有梯度分片（本地的+接收的）聚合
-                if received_grad_shards:
+                if received_grad_tuples:
+                    self.aggregation_timer.start()
                     model_was_updated_by_peers = True
-                    all_shards_for_avg = [local_grad_shard] + [s.to(self.device) for s in received_grad_shards]
-                    avg_grad_shard = torch.stack(all_shards_for_avg).mean(dim=0)
+                    num_remote_grads = len(received_grad_tuples)
+                    remote_steps = [t[1] for t in received_grad_tuples]
+                    logger.debug(
+                        f"[Stage 2 Aggregation] ParamShard '{param_name[:30]}...': "
+                        f"Aggregating local grad (step {self.current_step}) with {num_remote_grads} remote grads from steps: {remote_steps}"
+                    )
+                    alpha_local = self._calculate_adaptive_alpha(self.current_step)
+                    weighted_grad_sum = local_grad_shard.to(self.device) * alpha_local
+                    total_weight = alpha_local
+
+                    for grad_shard, received_step in received_grad_tuples:
+                        alpha_remote = self._calculate_adaptive_alpha(received_step)
+                        weighted_grad_sum.add_(grad_shard.to(self.device), alpha=alpha_remote)
+                        total_weight += alpha_remote
+                    
+                    if total_weight > 1e-6:
+                        avg_grad_shard = weighted_grad_sum / total_weight
+                    else:
+                        avg_grad_shard = torch.zeros_like(param_shard_view.data)
                     param_shard_view.grad = avg_grad_shard
+                    self.aggregation_timer.stop()
                 else:
-                    # 如果没有收到任何远程梯度，只使用本地梯度更新
                     param_shard_view.grad = local_grad_shard.to(self.device)
 
                 # d. 清理缓冲区
                 if param_name in self.grad_shard_buffer:
                     self.grad_shard_buffer[param_name] = []
 
+            # 梯度裁剪
+            # params_with_grad = [p for p in self.local_optimizer.param_groups[0]['params'] if p.grad is not None]
+            # if params_with_grad:
+            #     clip_grad_norm_(params_with_grad, max_norm=1.0)
             self.local_optimizer.step()
+            self.local_optimizer.zero_grad()
             self._write_back_persistent_shards_to_gpu_cache()
 
             # 准备广播更新后的参数分片
-            if self.should_aggregate:
-                with torch.no_grad():
-                    for param_shard_view in self.local_optimizer.param_groups[0]['params']:
-                        broadcast_content = {
-                            'param_name': param_shard_view.fedspeed_name,
-                            'shard_data': param_shard_view.data.cpu().clone(),
-                            'source_rank': self.rank,
-                            'step': self.current_step
-                        }
-                        updated_shards_for_broadcast.append(broadcast_content)
-            
-            self.temp_full_gradients.clear() 
-            # 回收显存
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            self.aggregation_timer.start()
+            with torch.no_grad():
+                for param_shard_view in self.local_optimizer.param_groups[0]['params']:
+                    broadcast_content = {
+                        'param_name': param_shard_view.fedspeed_name,
+                        'shard_data': param_shard_view.data.cpu().clone(),
+                        'source_rank': self.rank,
+                        'step': self.current_step
+                    }
+                    updated_shards_for_broadcast.append(broadcast_content)
+            self.aggregation_timer.stop()
 
             return updated_shards_for_broadcast, model_was_updated_by_peers
 
@@ -1599,6 +1658,7 @@ class FedSpeedEngine:
             should_aggregate_now = (self.current_step) % self.aggregation_steps == 0
             
             if should_aggregate_now:
+                self.aggregation_timer.start()
                 logger.info(f"[Stage 1] Aggregation step. Preparing to dispatch layer gradients.")
                 # 将梯度按层分组
                 grads_by_layer = {i: {} for i in range(len(self.logical_layers_names))}
@@ -1631,13 +1691,16 @@ class FedSpeedEngine:
                                 'param_name': name,
                                 'grad_shard_data': grad.cpu().clone(),
                                 'source_rank': self.rank,
+                                'step': self.current_step
                             }
                             grouped_shards_to_dispatch[target_client_id].append(dispatch_content)
-            
+                self.aggregation_timer.stop()
+
             self.temp_full_gradients.clear()
+
             # 返回完整的本地梯度 和 (可能为空的)待分发梯度
             return my_local_full_gradients, grouped_shards_to_dispatch
-
+        # --- 阶段二或不分组 ---
         else:
             my_local_grad_shards = {}
             grouped_shards_to_dispatch = {}
@@ -1648,6 +1711,7 @@ class FedSpeedEngine:
                 if self.current_step == self.stage_one_steps:
                     # 阶段转换点，强制聚合
                     self.should_aggregate = True
+                    self.is_in_stage_one = False
                 elif self.current_step > self.stage_one_steps and self.current_step % self.aggregation_steps == 0:
                     # 第二阶段，按频率聚合
                     self.should_aggregate = True
@@ -1669,7 +1733,7 @@ class FedSpeedEngine:
                 for rank_idx, grad_shard in enumerate(grad_shards_list):
                     if rank_idx == self.rank:
                         my_local_grad_shards[name] = grad_shard
-                    elif self.should_aggregate:
+                    else:
                         # 这是需要发给别人的分片
                         if self.aggregation_steps > 1:
                             # 多步模式：存入累加器
@@ -1677,15 +1741,20 @@ class FedSpeedEngine:
                             if target_rank not in self.remote_grad_accumulator:
                                 self.remote_grad_accumulator[target_rank] = {}
                             if name not in self.remote_grad_accumulator[target_rank]:
-                                self.remote_grad_accumulator[target_rank][name] = {'sum': torch.zeros_like(grad_shard), 'count': 0}
-                            
+                                self.remote_grad_accumulator[target_rank][name] = {
+                                    'sum': torch.zeros_like(grad_shard), 'count': 0,
+                                    'step': self.current_step
+                                    }
                             self.remote_grad_accumulator[target_rank][name]['sum'].add_(grad_shard)
                             self.remote_grad_accumulator[target_rank][name]['count'] += 1
+                            self.remote_grad_accumulator[target_rank][name]['step'] = self.current_step
                         else:
+                            self.aggregation_timer.start()
                             dispatch_content = {
                                 'param_name': name,
                                 'grad_shard_data': grad_shard.cpu().clone(),
                                 'source_rank': self.rank,
+                                'step': self.current_step
                             }
                             target_client_id = self.rank_to_client_id_map.get(rank_idx)
 
@@ -1693,19 +1762,21 @@ class FedSpeedEngine:
                             if target_client_id not in grouped_shards_to_dispatch:
                                 grouped_shards_to_dispatch[target_client_id] = []
                             grouped_shards_to_dispatch[target_client_id].append(dispatch_content)
+                            self.aggregation_timer.stop()
             
             self.temp_full_gradients.clear()
 
-            if self.aggregation_steps > 1:
-                if self.current_step % self.aggregation_steps == 0:
-                    grouped_shards_to_dispatch = self._prepare_dispatch_from_accumulator()
+            if self.should_aggregate and self.aggregation_steps > 1:
+                self.aggregation_timer.start()
+                grouped_shards_to_dispatch = self._prepare_dispatch_from_accumulator()
+                self.aggregation_timer.stop()
 
             # 返回本地分片 和 按目标分组的待发送分片
             return my_local_grad_shards, grouped_shards_to_dispatch
 
     def _prepare_dispatch_from_accumulator(self):
         """
-        【完整版】从累加器中准备要分发的平均梯度。
+        从累加器中准备要分发的平均梯度。
         在聚合 step 调用此函数。
         """
         if not self.remote_grad_accumulator:
@@ -1731,6 +1802,7 @@ class FedSpeedEngine:
                         'param_name': name,
                         'grad_shard_data': avg_grad.cpu(), # 移动到 CPU 准备发送
                         'source_rank': self.rank,
+                        'step': acc_data['step']
                     }
                     shard_list_for_target.append(content)
             
@@ -1753,13 +1825,14 @@ class FedSpeedEngine:
         """
         param_name = content.get('param_name')
         grad_shard_data = content.get('grad_shard_data')
+        received_step = content.get('step')
 
-        if param_name and grad_shard_data is not None:
+        if param_name and grad_shard_data is not None and received_step is not None:
             # --- 核心修正：确保添加到 buffer 的是 Tensor ---
             if isinstance(grad_shard_data, torch.Tensor):
                 if param_name in self.grad_shard_buffer:
-                    self.grad_shard_buffer[param_name].append(grad_shard_data.to(self.device))
-                    logger.debug(f"Rank {self.rank}: Received and buffered grad shard for '{param_name}'.")
+                    self.grad_shard_buffer[param_name].append((grad_shard_data.to(self.device), received_step))
+                    logger.debug(f"Rank {self.rank}: Received and buffered grad shard for '{param_name}' from step {received_step}.")
                 else:
                     logger.warning(f"Rank {self.rank}: Received grad shard for unmanaged param '{param_name}'.")
             else:
@@ -1916,6 +1989,30 @@ class FedSpeedEngine:
                         persistent_shard_param.data.copy_(shard_to_set)
 
             logger.info(f"Rank {self.rank}: Persistent shards have been updated from the provided vector.")
+
+    def _calculate_adaptive_alpha(self, received_step):
+        """一个辅助函数，用于计算自适应的聚合权重。"""
+        initial_alpha = 0.5
+        staleness = (self.current_step - received_step) / self.aggregation_steps
+        logger.debug(f"staleness: {staleness}")
+        # 如果消息来自未来，则不认为是陈旧的
+        if staleness < 0: 
+            return initial_alpha
+            
+        func_type = self.adaptive_weight_cfg.get('type', 'constant')
+        if func_type == 'exponential':
+            decay_rate = self.adaptive_weight_cfg.get('decay_rate', 0.9)
+            logger.debug(
+            f"[AdaptiveWeight] current_step={self.current_step}, received_step={received_step}, "
+            f"calculated_alpha={initial_alpha * (decay_rate ** staleness):.4f}"
+        )
+            return initial_alpha * (decay_rate ** staleness)
+        elif func_type == 'linear':
+            decay_factor = self.adaptive_weight_cfg.get('decay_factor', 0.01)
+            return max(0.0, initial_alpha - staleness * decay_factor)
+        # ... (可以扩展其他函数)
+        else: # 'constant'
+            return initial_alpha
 
     def profile_sharded_memory(self):
         """计算各类分片化状态的内存占用。"""
@@ -2351,6 +2448,13 @@ def natural_sort_key(s):
     """
     return [int(text) if text.isdigit() else text.lower()
             for text in re.split('([0-9]+)', s)]
+
+def _sanitize_model_name_for_path(model_name: str) -> str:
+    """
+    一个辅助函数，用于将模型名称字符串转换为适合用作文件路径的格式。
+    例如: 'gpt2@huggingface_llm' -> 'gpt2_huggingface_llm'
+    """
+    return re.sub(r'[^a-zA-Z0-9_\-.]', '_', model_name)
 
 def log_memory_usage(stage_name):
     """打印当前 rank 的 GPU 内存使用情况。"""

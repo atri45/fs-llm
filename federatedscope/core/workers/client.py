@@ -186,7 +186,7 @@ class Client(BaseClient):
                                    is_attacker=self.is_attacker,
                                    monitor=self._monitor)
         self.device = device
-        self.monitor = PerformanceMonitor(self.device)
+        # self.monitor = PerformanceMonitor(self.device)
 
         # For client-side evaluation
         self.best_results = dict()
@@ -332,7 +332,7 @@ class Client(BaseClient):
         Arguments:
             message: The received message
         """
-        self.monitor.start()
+        # self.monitor.start()
         
         if 'ss' in message.msg_type:
             # A fragment of the shared secret
@@ -672,7 +672,7 @@ class Client(BaseClient):
                                 strict=self._cfg.federate.share_local_model)
 
         self._monitor.finish_fl()
-        self.monitor.stop()
+        # self.monitor.stop()
 
     def callback_funcs_for_converged(self, message: Message):
         """

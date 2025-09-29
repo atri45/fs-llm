@@ -4,24 +4,24 @@ early_stop:
 federate:
   method: fedspeed
   aggregation_mode: 'shardedGradient'
-  aggregation_steps: 20
+  aggregation_steps: 1
   asynchronous_aggregation: True
-  anonymous_routing: False
+  anonymous_routing: True
   use_activation_checkpointing: True
   use_offline_model: True
   two_stages: 
-    use: True
-    stage_one_steps: 100
-    noniid: True
+    use: False
+    stage_one_steps: 600
+    noniid: False
     group_num: 2
   mode: distributed
   client_num: 4
-  save_to: "gpt2_alpaca.ckpt"
+  save_to: "./saved_models/gpt2_alpaca.ckpt"
 data:
   root: data/
-  type: 'rosetta_alpaca@llm'
-  splits: [0.98,0.01,0.01]
-  splitter: 'grouped'
+  type: 'gsm8k@llm'
+  splits: [0.9,0.1,0]
+  splitter: 'iid'
   splitter_args: [ 
     {
       num_groups: 2,
@@ -31,7 +31,7 @@ data:
   ]
 distribute:
   use: True
-  server_host: '127.0.0.1'
+  server_host: '10.214.151.191'
   server_port: 50051
   role: 'server'
   data_idx: -1
@@ -59,13 +59,16 @@ train:
   local_update_steps: 5000
   batch_or_epoch: batch
   optimizer:
-    lr: 0.001
+    type: AdamW
+    lr: 0.0003
     weight_decay: 0.0
+    betas: [0.9, 0.999]
+    eps: 1e-8
 criterion:
   type: CrossEntropyLoss
 trainer:
   type: fedspeedtrainer
 eval:
-  freq: 100
+  freq: 50
   metrics: ['loss']
   count_flops: False

@@ -228,7 +228,7 @@ class gRPCCommManager(object):
 
     def send(self, message):
         # --- 检查消息类型，决定是否阻塞 ---
-        blocking_msg_types = ['join_in', 'fedspeed_setup', 'fedspeed_init_package', 'fedspeed_ready', 'early_stop_vote' ,'sync_model_para', 'aggregated_model_para']
+        blocking_msg_types = ['assign_client_id', 'ask_for_join_in_info', 'join_in_info', 'address', 'model_para', 'ss_model_para', 'evaluate', 'metrics', 'finish', 'converged', 'join_in', 'fedspeed_setup', 'fedspeed_init_package', 'fedspeed_ready', 'early_stop_vote' ,'sync_model_para', 'aggregated_model_para']
         is_blocking = message.msg_type in blocking_msg_types
 
         receiver = message.receiver

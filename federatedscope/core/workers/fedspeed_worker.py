@@ -14,7 +14,7 @@ from federatedscope.core.workers.client import Client
 from federatedscope.core.message import Message
 from federatedscope.core.auxiliaries.utils import merge_dict_of_results, add_prefix_to_path
 from federatedscope.llm.trainer.fedspeed_engine import FedSpeedCoordinatorEngine
-from federatedscope.llm.trainer.fedspeed_trainer import FedSpeedTrainer, EarlyStopException
+from federatedscope.llm.trainer.fedspeed_trainer import AggregationTimer, FedSpeedTrainer, EarlyStopException
 from torch.nn.utils.convert_parameters import vector_to_parameters
 from collections import OrderedDict
 from federatedscope.core.communication import gRPCCommManager
@@ -22,70 +22,73 @@ from cryptography.hazmat.primitives import serialization
 
 logger = logging.getLogger(__name__)
 
-class PerformanceMonitor:
-    def __init__(self, device):
-        self.device = device
-        self.start_time = 0.0
-        self.end_time = 0.0
-        
-        # 追踪 CPU 内存 (RAM)
-        self.process = psutil.Process(os.getpid())
-        self.cpu_mem_usage_peak = 0.0 # 单位: MB
 
-        # 追踪 GPU 显存 (VRAM)
-        self.gpu_mem_allocated_peak = 0.0 # 单位: MB
-        self.gpu_mem_reserved_peak = 0.0  # 单位: MB
-
-    def _is_cuda(self):
-        """一个辅助函数，用于判断是否在使用 CUDA。"""
-        if not torch.cuda.is_available():
-            return False
-        if isinstance(self.device, torch.device):
-            return self.device.type == 'cuda'
-        elif isinstance(self.device, str):
-            return 'cuda' in self.device
-        elif isinstance(self.device, int):
-            return self.device >= 0 # 假设非负整数代表 GPU ID
-        return False
+class CommunicationMonitor:
+    """
+    一个简单的类，用于追踪客户端在【训练过程中】发送的总数据量。
+    """
+    def __init__(self, client_id):
+        self.client_id = client_id
+        self._total_bytes_sent = 0
+        self.gb_factor = 1024 ** 3
+        self.is_monitoring = False
 
     def start(self):
-        """开始计时和监控。"""
-        # 使用辅助函数进行判断
-        if self._is_cuda():
-            torch.cuda.reset_peak_memory_stats(self.device)
-        
-        self.start_time = time.time()
-        logger.info("Performance monitor started.")
-        
-    def stop(self):
-        """停止计时，收集峰值数据，并打印报告。"""
-        self.end_time = time.time()
-        
-        # 收集峰值数据
-        self.cpu_mem_usage_peak = self.process.memory_info().rss / (1024 ** 2)
-        
-        if self._is_cuda():
-            stats = torch.cuda.memory_stats(self.device)
-            self.gpu_mem_allocated_peak = stats["allocated_bytes.all.peak"] / (1024 ** 2)
-            self.gpu_mem_reserved_peak = stats["reserved_bytes.all.peak"] / (1024 ** 2)
+        """开始监控。"""
+        logger.debug(f"Communication monitor for Client #{self.client_id} started.")
+        self._total_bytes_sent = 0 # 每次开始时重置计数器
+        self.is_monitoring = True
 
-        self.report()
+    def stop(self):
+        """停止监控。"""
+        logger.debug(f"Communication monitor for Client #{self.client_id} stopped.")
+        self.is_monitoring = False
+
+    def record_sent_data(self, message_obj):
+        """
+        记录一次发送的数据大小。
+        """
+        if not self.is_monitoring: # 只有在监控状态下才记录
+            return
+        
+        if message_obj is None or message_obj.content is None:
+            return
+        
+        try:
+            payload_bytes = pickle.dumps(message_obj.content)
+            self._total_bytes_sent += len(payload_bytes)
+        except (pickle.PicklingError, TypeError) as e:
+            logger.warning(f"Could not estimate size of message content (type: {type(message_obj.content)}). Skipping. Error: {e}")
+
+    def record_dist_communication(self, op_name: str, tensor: torch.Tensor, world_size: int):
+        """
+        记录一次 torch.distributed 操作产生的通信量。
+        """
+        # --- START OF MODIFICATION ---
+        if not self.is_monitoring: # <-- 新增：只有在监控状态下才记录
+            return
+        # --- END OF MODIFICATION ---
+        
+        if not isinstance(tensor, torch.Tensor):
+            return
+
+        tensor_bytes = tensor.numel() * tensor.element_size()
+        
+        if op_name in ['all_gather', 'all_reduce', 'reduce_scatter']:
+            communication_bytes = tensor_bytes * (world_size - 1)
+            self._total_bytes_sent += communication_bytes
+
+    @property
+    def total_gb_sent(self):
+        """返回以GB为单位的总发送量。"""
+        return self._total_bytes_sent / self.gb_factor
 
     def report(self):
-        """打印性能报告。"""
-        total_seconds = self.end_time - self.start_time
-        total_minutes = total_seconds / 60.0
-
-        logger.info("----------- Performance Report -----------")
-        logger.info(f"  - Total Training Time: {total_minutes:.2f} minutes ({total_seconds:.2f} seconds)")
-        logger.info(f"  - CPU Memory Peak Usage (RSS): {self.cpu_mem_usage_peak:.2f} MB")
-        
-        if self._is_cuda():
-            logger.info(f"  - GPU Memory Peak Allocated: {self.gpu_mem_allocated_peak:.2f} MB")
-            logger.info(f"  - GPU Memory Peak Reserved: {self.gpu_mem_reserved_peak:.2f} MB")
-        else:
-            logger.info("  - GPU Monitoring: Not available (CUDA not found or not used).")
-        logger.info("------------------------------------------")
+        """打印最终的通信成本报告。"""
+        logger.info(f"----------- Client #{self.client_id} Communication Report -----------")
+        logger.info(f"  - Total Data Sent: {self.total_gb_sent:.4f} GB")
+        logger.info(f"  - Total Data Sent (Bytes): {self._total_bytes_sent} bytes")
+        logger.info("----------------------------------------------------")
 
 
 class FedSpeedServer(Server):
@@ -97,6 +100,10 @@ class FedSpeedServer(Server):
         self.coordinator_engine = None
         self.final_shards_buffer = {}
         self.rank_to_client_id_map = {}
+        self.comm_monitor = CommunicationMonitor(self.ID) 
+        self._original_send = self.comm_manager.send
+        self.comm_manager.send = self._send_with_monitoring
+        self.aggregation_timer = AggregationTimer()
         
         self.asynchronous = self._cfg.federate.get('asynchronous_aggregation', False)
         self.anonymous_routing = self._cfg.federate.get('anonymous_routing', False)
@@ -106,12 +113,43 @@ class FedSpeedServer(Server):
             self.asynchronous = False
 
         self.register_handlers('fedspeed_ready', self.callback_funcs_for_fedspeed_ready)
+        self.register_handlers('finish', self.terminate)
         if self.asynchronous == False:
             #  为同步聚合准备缓冲区
             self.sync_model_buffer = {}
             self.register_handlers('sync_model_para', self.callback_funcs_for_sync_model_para)
         if self.anonymous_routing:
             self.public_key_buffer = {}
+
+    def _send_with_monitoring(self, message: Message):
+        """
+        一个新的 send 方法，它在调用原始 send 方法之前记录数据大小。
+        """
+        # 记录数据大小
+        # 注意：广播消息会被记录多次，我们需要正确处理
+        
+        # 检查接收者是不是一个列表（广播或多播）
+        num_receivers = 1
+        if isinstance(message.receiver, list):
+            num_receivers = len(message.receiver)
+        
+        # 估算单个消息的大小
+        payload_bytes = 0
+        if message.content is not None:
+            try:
+                payload_bytes = len(pickle.dumps(message.content))
+            except (pickle.PicklingError, TypeError):
+                pass # 忽略无法序列化的内容
+
+        # 总发送量 = 单个消息大小 * 接收者数量
+        total_bytes_sent_this_call = payload_bytes * num_receivers
+        
+        # 只有在监控状态下才累加
+        if self.comm_monitor.is_monitoring:
+            self.comm_monitor._total_bytes_sent += total_bytes_sent_this_call
+        
+        # 调用原始的 send 方法完成实际的发送
+        return self._original_send(message)
 
     def trigger_for_start(self):
         if self.check_client_join_in():
@@ -173,6 +211,7 @@ class FedSpeedServer(Server):
         if self.fedspeed_ready_client_count == len(self.fedspeed_participants):
             logger.info("All clients are ready! Server is now preparing initialization packages...")
             self.start_training_package_distribution()
+            self.comm_monitor.start()
 
     def start_training_package_distribution(self):
         """
@@ -208,6 +247,7 @@ class FedSpeedServer(Server):
         """
         处理客户端在同步模式下上传的模型参数。
         """
+        self.aggregation_timer.start()
         sender_id = message.sender
         current_step = message.state
         content = message.content
@@ -219,6 +259,7 @@ class FedSpeedServer(Server):
             params_vec = pickle.loads(pickled_bytes).numpy()
         except Exception as e:
             logger.error(f"Failed to deserialize b64_pickled_tensor from client #{sender_id}: {e}")
+            self.aggregation_timer.stop()
             return
 
         # 将收到的模型存入当前 step 的缓冲区
@@ -260,18 +301,28 @@ class FedSpeedServer(Server):
                 logger.error(f"Error during aggregation for Step #{current_step}: {e}", exc_info=True)
                 # 清理缓冲区并返回，避免卡死
                 del self.sync_model_buffer[current_step]
+                self.aggregation_timer.stop()
                 return
 
             # 清理该 step 的缓冲区
             del self.sync_model_buffer[current_step]
+            self.aggregation_timer.stop()
             
+    def terminate(self, message: Message):
+        """
+        在服务器终止时，停止监控并打印报告。
+        """
+        # 停止监控并打印报告
+        self.aggregation_timer.report()
+        if hasattr(self, 'comm_monitor'):
+            self.comm_monitor.stop()
+            self.comm_monitor.report()
 
 class FedSpeedClient(Client):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.my_rank = None
         self.dist_group_initialized = False
-        self.monitor = PerformanceMonitor(self.device)
         self.asynchronous = self._cfg.federate.get('asynchronous_aggregation', False)
         self.anonymous_routing = self._cfg.federate.get('anonymous_routing', False)
         self.is_decentralized_sharded_mode = self._cfg.federate.aggregation_mode == 'shardedGradient'
@@ -279,7 +330,14 @@ class FedSpeedClient(Client):
             self.anonymous_routing = True
         if self._cfg.federate.aggregation_mode == 'fl-sim':
             self.asynchronous = False
-        
+
+        self.comm_monitor = CommunicationMonitor(self.ID)
+        # 包裹comm_manager.send 方法
+        # 保存原始的 send 方法
+        self._original_send = self.comm_manager.send
+        # 用带监控功能的 send 方法替换它
+        self.comm_manager.send = self._send_with_monitoring
+
         self.register_handlers('fedspeed_setup', self.callback_funcs_for_fedspeed_setup)
         self.register_handlers('fedspeed_init_package', self.callback_funcs_for_init_package)
 
@@ -301,6 +359,15 @@ class FedSpeedClient(Client):
             # 同步模式的处理器
             self.register_handlers('aggregated_model_para', self.trainer.handle_model)
 
+    def _send_with_monitoring(self, message: Message):
+        """
+        一个新的 send 方法，它在调用原始 send 方法之前记录数据大小。
+        """
+        # 记录数据大小
+        self.comm_monitor.record_sent_data(message)
+        # 调用原始的 send 方法完成实际的发送
+        return self._original_send(message)
+
     def callback_funcs_for_fedspeed_setup(self, message: Message):
         if dist.is_initialized():
             logger.warning(f"Client #{self.ID}: Default process group already initialized. Destroying it before creating new FedSpeed group.")
@@ -316,6 +383,7 @@ class FedSpeedClient(Client):
 
         if 'client_id' in config:
             self.ID = config['client_id']
+            self.comm_monitor.client_id = self.ID
             logger.info(f"Client ID has been set to #{self.ID}.")
 
         # ... (完整的 init_process_group 逻辑) ...
@@ -339,7 +407,7 @@ class FedSpeedClient(Client):
                     raise TypeError(f"FedSpeedClient is not configured with FedSpeedTrainer.")
                 
                 # b. 手动触发 Trainer 的 Router 初始化
-                self.trainer.initialize_router(self.ID, self.comm_manager)
+                self.trainer.initialize_router(self.ID)
                 
                 # c. 发送公钥
                 if hasattr(self.trainer, 'router') and self.trainer.router:
@@ -427,8 +495,9 @@ class FedSpeedClient(Client):
                     raise RuntimeError("Anonymous routing enabled, but public key book not received or router not initialized.")
 
             # 4. 现在可以安全地开始训练了
-            self.monitor.start()
+            # self.monitor.start()
             logger.info("All setup complete. Starting FedSpeed training...")
+            self.comm_monitor.start()
             self.trainer.train()
 
         except EarlyStopException:
@@ -437,46 +506,130 @@ class FedSpeedClient(Client):
         finally:
             # 4. 无论训练是否成功，都尝试上传最终结果
             # 这确保了即使训练中途出错，也能保存当时的模型状态
+            self.comm_monitor.stop()
+            self.trainer.monitor.stop()
             logger.info("Training finished or interrupted.")
-            self.monitor.stop()
-            # if self.trainer.early_stopper and self.trainer.early_stopper.early_stop:
-            #     self.trainer.early_stopper.load_best_checkpoint(self.trainer.fedspeed_engine)
+            self.comm_monitor.report() 
             self.save_final_model_locally()
+            # 发送训练结束信号给服务器
+            try:
+                self.comm_manager.send(
+                    Message(msg_type='finish',
+                            sender=self.ID,
+                            receiver=[self.server_id],
+                            state=self.state,
+                            content="done") # content 可以是任意内容
+                )
+                # 等待一小段时间，确保消息有足够的时间被发送出去
+                time.sleep(2)
+            except Exception as e:
+                logger.error(f"Client #{self.ID}: Failed to send 'finish' message to server. Error: {e}")
             self.comm_manager.stop()
 
     def save_final_model_locally(self):
         """
-        将最终的【完整】可训练参数保存到本地磁盘。
+        将最终的最佳模型以 FederatedScope 兼容的、完整的 state_dict 格式保存到本地磁盘。
         """
+        if self.my_rank != 0:
+            logger.info(f"Client #{self.ID} (Rank {self.my_rank}): Not Rank 0, skipping final model save.")
+            # 即使不保存，也应该清理临时文件
+            best_model_checkpoint_path = self.trainer.early_stopper.checkpoint_path
+            if os.path.exists(best_model_checkpoint_path):
+                os.remove(best_model_checkpoint_path)
+            return
+        
         if not (hasattr(self.trainer, 'fedspeed_engine') and self.trainer.fedspeed_engine):
             logger.error("FedSpeedEngine not found. Cannot save model.")
             return
 
         engine = self.trainer.fedspeed_engine
-        # 获取 EarlyStopper 保存的临时检查点文件路径
         best_model_checkpoint_path = self.trainer.early_stopper.checkpoint_path
         
         if not os.path.exists(best_model_checkpoint_path):
             logger.error(f"Best model checkpoint file not found at '{best_model_checkpoint_path}'. Cannot save final model.")
             return
 
-        # --- 最终文件保存的目标路径 (与你之前的逻辑一致) ---
-        save_dir = self._cfg.federate.get('client_save_path', './fedspeed_final_models/')
-        os.makedirs(save_dir, exist_ok=True)
-        
-        base_filename = self._cfg.federate.save_to
-        final_filename = f"client_{self.ID}_{base_filename}"
-        final_save_path = os.path.join(save_dir, final_filename)
+        # --- 最终文件保存的目标路径 ---
+        os.makedirs("./saved_models/", exist_ok=True)
+        final_save_path = self._cfg.federate.save_to
+        if not final_save_path:
+            logger.error("`federate.save_to` is not specified in the config. Cannot save model.")
+            return
 
         try:
-            # 使用 shutil.move 来重命名并移动文件，更高效
-            shutil.move(best_model_checkpoint_path, final_save_path)
+            # --- 核心逻辑：获取最新 state_dict 并智能更新 ---
+            logger.info(f"Reconstructing the full model for final saving (mode: {engine.aggregation_mode})...")
+
+            # 1. 加载 EarlyStopper 保存的扁平化可训练参数向量
+            best_trainable_params_vec_cpu = torch.load(best_model_checkpoint_path, map_location='cpu')
+
+            # 2. 获取模型当前的 state_dict 作为最终要保存的模板和来源。
+            #    这是最权威的键名和冻结参数来源。
+            final_state_dict = self.model.state_dict()
+            state_dict_keys = list(final_state_dict.keys())
+
+            # 3. 恢复可训练参数
+            #    a. 获取 engine 认为的、有序的可训练参数名
+            trainable_param_names_from_engine = engine.ordered_trainable_names
             
+            #    b. 动态查找这些参数在 state_dict 中对应的键
+            matched_keys_in_state_dict_for_update = []
+            for engine_name in trainable_param_names_from_engine:
+                matched_key = None
+                # 尝试多种匹配策略，以 endswith 为主，因为它对前缀不敏感
+                for key in state_dict_keys:
+                    if key == engine_name or engine_name.endswith("." + key) or key.endswith("." + engine_name):
+                        # 检查更精确的后缀匹配，避免例如 "layer.weight" 错误匹配 "another_layer.weight"
+                        if engine_name.split('.')[-1] == key.split('.')[-1]:
+                            matched_key = key
+                            break
+                # Fallback to simple endswith if no precise match
+                if not matched_key:
+                    for key in state_dict_keys:
+                        if engine_name.endswith(key):
+                            matched_key = key
+                            break
+                
+                if matched_key:
+                    matched_keys_in_state_dict_for_update.append(matched_key)
+                else:
+                    raise KeyError(f"Could not find a matching key in state_dict for "
+                                   f"engine parameter '{engine_name}'.")
+
+            #    c. 创建一个临时的、与 state_dict 结构匹配的参数列表
+            params_to_update = [final_state_dict[key] for key in matched_keys_in_state_dict_for_update]
+            
+            #    d. 调用 vector_to_parameters 将最佳参数写回
+            #       这会就地更新 final_state_dict 中的张量
+            vector_to_parameters(best_trainable_params_vec_cpu.to(params_to_update[0].device), params_to_update)
+
+            # 4. 此时，final_state_dict 已经包含了所有冻结参数和更新后的可训练参数。
+            #    我们可能需要对 key 进行归一化以匹配评估脚本的期望
+            normalized_state_dict = OrderedDict()
+            for key, value in final_state_dict.items():
+                key_for_saving = key
+                if key_for_saving.startswith('model.'):
+                     key_for_saving = key_for_saving[len('model.'):]
+                normalized_state_dict[key_for_saving] = value.cpu().clone()
+
+            # 5. 按照 FS-LLM 的格式构建最终的检查点字典
+            ckpt_to_save = {
+                'cur_round': -1,
+                'model': normalized_state_dict
+            }
+            
+            # 6. 保存
+            torch.save(ckpt_to_save, final_save_path)
+            
+            # 7. 清理
+            os.remove(best_model_checkpoint_path)
+
+            # --- 日志记录 ---
             best_score_info = ""
             if self.trainer.early_stopper.best_score is not None:
                 best_score_info = f"Best eval loss: {self.trainer.early_stopper.best_score:.4f}. "
             
-            logger.info(f"Client #{self.ID} (Rank 0): {best_score_info}Final best model saved to '{final_save_path}'")
+            logger.info(f"Client #{self.ID} (Rank 0): {best_score_info}Final full model (in state_dict format) saved to '{final_save_path}'.")
 
         except Exception as e:
-            logger.error(f"Failed to move best model checkpoint from '{best_model_checkpoint_path}' to '{final_save_path}': {e}")  
+            logger.error(f"Failed to save final compatible model to '{final_save_path}': {e}", exc_info=True)

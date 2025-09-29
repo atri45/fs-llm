@@ -160,6 +160,20 @@ class FSChatBot(object):
         input_ids = input_text.input_ids.to(self.device)
         attention_mask = input_text.attention_mask.to(self.device)
 
+        if self.tokenizer.pad_token_id is None:
+            # 如果 tokenizer 连 pad_token_id 都没有，就用 eos_token_id
+            pad_token_id_to_use = self.tokenizer.eos_token_id
+        else:
+            # 否则，就用 tokenizer 自己的 pad_token_id
+            pad_token_id_to_use = self.tokenizer.pad_token_id
+        
+        # 将 pad_token_id 添加到 generate_kwargs 中
+        # 如果用户已经指定了 pad_token_id，我们的值会覆盖它，以确保正确性
+        generate_kwargs['pad_token_id'] = pad_token_id_to_use
+        # 确保 eos_token_id 也存在，因为错误信息是基于它的存在而触发的
+        if 'eos_token_id' not in generate_kwargs:
+            generate_kwargs['eos_token_id'] = self.tokenizer.eos_token_id
+
         output_ids = self.model.generate(input_ids=input_ids,
                                          attention_mask=attention_mask,
                                          **generate_kwargs)

@@ -12,6 +12,9 @@ from federatedscope.core.data.utils import download_url
 
 logger = logging.getLogger(__name__)
 
+# 创建一个全局缓存字典
+_tokenizer_cache = {}
+
 
 @dataclass
 class LLMDataCollator(object):
@@ -78,6 +81,11 @@ def get_tokenizer(model_name, cache_dir, tok_len=128, pkg='huggingface_llm'):
             - tokenizer: A transformers.AutoTokenizer object.
             - num_new_tokens: An integer, the number of new special tokens
     """
+    cache_key = (model_name, tok_len, pkg)
+    if cache_key in _tokenizer_cache:
+        logger.info(f"Tokenizer for '{model_name}' found in cache. Reusing it.")
+        return _tokenizer_cache[cache_key]
+    
     assert pkg in ['huggingface_llm', 'modelscope_llm'], \
         f'Not supported package {pkg}.'
 
@@ -105,6 +113,8 @@ def get_tokenizer(model_name, cache_dir, tok_len=128, pkg='huggingface_llm'):
         special_tokens["unk_token"] = DefaultToken.UNK_TOKEN.value
 
     num_new_tokens = tokenizer.add_special_tokens(special_tokens)
+
+    _tokenizer_cache[cache_key] = (tokenizer, num_new_tokens)
 
     return tokenizer, num_new_tokens
 

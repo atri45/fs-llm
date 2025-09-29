@@ -3,17 +3,17 @@ early_stop:
   patience: 0
 federate:
   mode: distributed
-  client_num: 2
-  total_round_num: 50
+  client_num: 4
+  total_round_num: 250
   save_to: "gpt2_new.ckpt"
 data:
   root: data/
-  type: 'alpaca@llm'
-  splits: [0.98,0.01,0.01]
+  type: 'rosetta_alpaca@llm'
+  splits: [0.85,0.1,0.05]
   splitter: 'iid'
 distribute:
   use: True
-  server_host: '127.0.0.1'
+  server_host: '10.214.151.191'
   server_port: 50051
   role: 'server'
   data_idx: 0
@@ -38,19 +38,16 @@ dataloader:
 model:
   type: 'gpt2@huggingface_llm'
 train:
-  local_update_steps: 10
+  local_update_steps: 25
   batch_or_epoch: batch
   optimizer:
-    type: AdamW
-    lr: 0.0003
+    lr: 0.001
     weight_decay: 0.0
-    betas: [0.9, 0.999]
-    eps: 1e-8
 criterion:
   type: CrossEntropyLoss
 trainer:
   type: llmtrainer
 eval:
-  freq: 1000
+  freq: 2
   metrics: ['loss']
   count_flops: False

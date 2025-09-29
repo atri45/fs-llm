@@ -4,14 +4,14 @@ early_stop:
   patience: 3
 federate:
   method: fedspeed
-  aggregation_mode: 'shardedGradient'
+  aggregation_mode: 'model'
   aggregation_steps: 1
   asynchronous_aggregation: True
   anonymous_routing: True
   use_activation_checkpointing: True
   mode: distributed
   client_num: 4
-  save_to: "./saved_models/gpt2_alpaca.ckpt"
+  save_to: "./saved_models/ablation2.ckpt"
   model_cache_path: './model_cache/'
   use_offline_model: True
   gpu_mem_pressure_threshold: 0.8
@@ -19,10 +19,10 @@ federate:
   prefetch_depth: 12
   transformer_block_class_name: 'GPT2Block'
   two_stages: 
-    use: False
+    use: True
     stage_one_steps: 600
     noniid: False
-    group_num: 2
+    group_num: 3
   adaptive_weight:
     use: True
     type: 'exponential'
@@ -45,9 +45,9 @@ distribute:
   server_host: '10.214.151.191'
   server_port: 50051
   client_host: '10.214.151.191'
-  client_port: 50052
+  client_port: 50054
   role: 'client'
-  data_idx: 1
+  data_idx: 3
   grpc_max_send_message_length: 1048576000
   grpc_max_receive_message_length: 1048576000
 llm:

@@ -1,24 +1,40 @@
 use_gpu: True
 early_stop:
-  patience: 0
+  patience: 3
 federate:
+  method: fedspeed
+  aggregation_mode: 'shardedGradient'
+  aggregation_steps: 1
+  asynchronous_aggregation: True
+  anonymous_routing: False
+  use_activation_checkpointing: True
+  use_offline_model: True
+  two_stages: 
+    use: True
+    stage_one_steps: 600
+    noniid: False
+    group_num: 3
   mode: distributed
-  client_num: 2
-  total_round_num: 50
-  save_to: "gpt2_new.ckpt"
+  client_num: 4
+  save_to: "./saved_models/ablation3.ckpt"
 data:
   root: data/
-  type: 'alpaca@llm'
-  splits: [0.98,0.01,0.01]
+  type: 'gsm8k@llm'
+  splits: [0.9,0.1,0]
   splitter: 'iid'
+  splitter_args: [ 
+    {
+      num_groups: 2,
+      base_splitter_type: 'lda',
+      alpha: 0.1
+    }
+  ]
 distribute:
   use: True
-  server_host: '127.0.0.1'
+  server_host: '10.214.151.191'
   server_port: 50051
-  client_host: '127.0.0.1'
-  client_port: 50053
-  role: 'client'
-  data_idx: 2
+  role: 'server'
+  data_idx: -1
   grpc_max_send_message_length: 1048576000
   grpc_max_receive_message_length: 1048576000
 llm:
@@ -40,7 +56,7 @@ dataloader:
 model:
   type: 'gpt2@huggingface_llm'
 train:
-  local_update_steps: 10
+  local_update_steps: 5000
   batch_or_epoch: batch
   optimizer:
     type: AdamW
@@ -51,8 +67,8 @@ train:
 criterion:
   type: CrossEntropyLoss
 trainer:
-  type: llmtrainer
+  type: fedspeedtrainer
 eval:
-  freq: 1000
+  freq: 50
   metrics: ['loss']
   count_flops: False
