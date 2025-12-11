@@ -84,7 +84,7 @@ class PipelinedReconstructor:
         numpy_array = np.load(file_path)
         param_cpu = torch.from_numpy(numpy_array)
         param_gpu = param_cpu.to(self.device, non_blocking=True)
-        
+
         # 直接加入 L1 缓存
         self._add_to_gpu_cache(param_name, param_gpu)
         
@@ -309,13 +309,18 @@ class FedSpeedEngine:
         self.sanitized_model_name = _sanitize_model_name_for_path(self.cfg.model.type)
 
         # 状态
-        self.aggregation_mode = self.cfg.federate.get('aggregation_mode', 'local-reconstruct')
+        self.aggregation_mode = self.cfg.federate.get('aggregation_mode')
         self.aggregation_steps = self.cfg.federate.get('aggregation_steps', 1)
         self.local_cache_path = self.cfg.federate.get('model_cache_path')
-        self.use_offline_model = self.cfg.federate.get('use_offline_model', False)
         self.two_stage = self.cfg.federate.two_stages.get('use', False)
         self.stage_one_steps = self.cfg.federate.two_stages.get('stage_one_steps', 250)
         self.noniid = self.cfg.federate.two_stages.get('noniid', False)
+        self.is_hybrid_mode = (
+            self.aggregation_mode == 'shardedGradient' and
+            self.two_stage and not self.noniid
+        )
+        if self.is_hybrid_mode:
+            self.aggregation_mode = 'local-reconstruct'
         self.adaptive_weight_cfg = self.cfg.federate.get('adaptive_weight', {'use': False})
         self.is_in_stage_one = self.two_stage
         self.local_trainable_names_stage1 = None
@@ -368,156 +373,163 @@ class FedSpeedEngine:
             self.logical_layers_names = self.grouping_metadata['logical_layers_names']
             # 构建一个参数名到层索引的快速查找映射
             self._build_param_to_layer_index_map()
-        
         self._attach_module_ids()
+
+        # 1. 获取元数据
         self.sharding_metadata = initial_shards.get('sharding_metadata', {})
-        if self.aggregation_mode in ['local-reconstruct', 'shardedGradient']:
-            state_dict = initial_shards.get('full_model_state_dict')
-            self._initialize_from_full_state_dict(state_dict)
 
-        else: # 处理 'gradient', 'model', 'fl-sim' 等基于分片的模式
-            logger.info(f"Initializing engine from sharded data for mode '{self.aggregation_mode}'.")
-            self._load_shards_and_build_maps(initial_shards)
+        # 2. 创建 Reconstructor (即使在 In-Memory 模式下)
+        #    因为它负责从磁盘加载数据，这是所有模式的共同起点。
+        self.reconstructor = PipelinedReconstructor(self, self.name_to_param_map, self.sanitized_model_name)
+        # self._prime_reconstructor_cpu_cache()
+        self._initialize_with_reconstructor()
 
-        # --- 设置所有参数的初始状态 ---
+        # 3. 为所有模式设置参数的初始状态
         self._set_initial_param_status()
+
+        # 3. 后续通用设置
         self.trainable_param_names = {name for name, p in self.model.named_parameters() if p.requires_grad}
         self.ordered_trainable_names = sorted(list(self.trainable_param_names), key=natural_sort_key)
-        # 为 decentralized 模式设置特定属性
-        if self.aggregation_mode == 'shardedGradient':
+        if self.aggregation_mode == 'shardedGradient' or self.is_hybrid_mode:
             self.grad_shard_buffer = {name: [] for name in self.trainable_param_names}
             self.rank_to_client_id_map = initial_shards.get('rank_to_client_id_map')
+        
         self._build_module_param_map()
         self._initialize_optimizer()
     
         initial_shards = None
 
      # --- 初始化函数 ---
-
-    def _initialize_from_full_state_dict(self, state_dict: dict):
+    def _prime_reconstructor_cpu_cache(self):
         """
-        处理所有需要从完整 state_dict 初始化的通用逻辑。
-        包括创建 Reconstructor、填充 CPU 缓存以及构建执行顺序。
+        一个统一的函数，负责从本地磁盘加载所有参数到 Reconstructor 的 CPU 缓存中。
+        这是所有模式的共同第一步。
         """
-        logger.info(f"Initializing engine from a full state_dict for mode '{self.aggregation_mode}'.")
-
-        # 1. 创建 PipelinedReconstructor
-        self.reconstructor = PipelinedReconstructor(self, self.name_to_param_map, self.sanitized_model_name)
-
-        if self.use_offline_model:
-            # --- 离线模式：从本地磁盘缓存加载 ---
-            logger.info("use_offline_model=True. Priming CPU cache from local disk cache...")
-            model_specific_cache_path = os.path.join(self.local_cache_path, self.sanitized_model_name)
-            if not model_specific_cache_path or not os.path.exists(model_specific_cache_path):
-                raise FileNotFoundError(f"use_offline_model is True, but the model_cache_path '{model_specific_cache_path}' does not exist.")
-            
-            offline_state_dict = {}
-            # 遍历模型的所有参数，尝试从缓存路径加载它们
-            for name, param in self.model.named_parameters():
-                # 使用与 Reconstructor 加载时相同的 key 归一化逻辑
-                key_to_find = name
-                if key_to_find.startswith("base_model.model."):
-                    key_to_find = key_to_find[len("base_model.model."):]
-                if key_to_find.startswith("model."):
-                    key_to_find = key_to_find[len("model."):]
-                
-                file_path = os.path.join(self.local_cache_path, key_to_find + ".npy")
-                if os.path.exists(file_path):
-                    numpy_array = np.load(file_path)
-                    # 使用模型的全局名称作为 key
-                    offline_state_dict[name] = torch.from_numpy(numpy_array)
-                else:
-                    logger.warning(f"Offline model parameter file not found: {file_path}. This parameter will not be loaded.")
-            
-            if not offline_state_dict:
-                 raise ValueError("use_offline_model is True, but no parameter files were found in the cache path.")
-
-            self.reconstructor.prime_cpu_cache(offline_state_dict)
-
-        else:
-            # 2. 归一化 state_dict 的 key 以匹配模型参数的全局名称
-            #    这是为了确保我们能正确地将服务器发来的 state_dict 映射到客户端本地模型可能存在的不同前缀的参数上
-            normalized_state_dict = {}
-            for name, param in self.model.named_parameters():
-                key_to_find = name
-                if key_to_find.startswith("base_model.model."):
-                    key_to_find = key_to_find[len("base_model.model."):]
-                if key_to_find.startswith("model."):
-                    key_to_find = key_to_find[len("model."):]    
-                if key_to_find in state_dict:
-                    # 使用模型的全局名称作为 key，值为 state_dict 中的数据
-                    normalized_state_dict[name] = state_dict[key_to_find]
-            
-            # 3. 填充 CPU 缓存
-            self.reconstructor.prime_cpu_cache(normalized_state_dict)
-
-            # 4. 在磁盘上创建分层存储
-            self._create_layer_cache_if_not_exists(state_dict)
-
-            logger.info(f"PipelinedReconstructor created and its CPU cache is primed with {len(normalized_state_dict)} parameters.")
-
-    def _load_shards_and_build_maps(self, initial_shards):
-        """用服务器发来的数据初始化参数状态和映射。"""
-        # 建立 name -> param 映射
-        temp_name_to_param = {name: p for name, p in self.model.named_parameters()}
-
-        with torch.no_grad():
-            for name, shard_info in initial_shards.items():
-                param = temp_name_to_param[name]
-                param.fedspeed_original_shape = shard_info['original_shape']
-                if shard_info['is_sharded']:
-                    
-                    # 这是一个分片参数 (冻结参数，或 gradient 模式下的所有参数)
-                    param.fedspeed_status = "SHARDED"
-                    param.fedspeed_shard = torch.nn.Parameter(
-                        shard_info['shard_data'].to(self.device), 
-                        requires_grad=False
-                    )
-                    param.data = torch.empty(0, dtype=param.fedspeed_shard.dtype, device=self.device)
-                else:
-                    # 这是一个完整的可训练参数 (只在 model 模式下出现)
-                    param.fedspeed_status = "FULL_PERSISTENT"
-                    # 将完整的参数数据直接加载到 param.data
-                    param.data = shard_info['shard_data'].to(self.device)
-                    # 这种参数没有 fedspeed_shard 属性
-                    param.fedspeed_shard = None
-
-    def _create_layer_cache_if_not_exists(self, state_dict):
-        """在本地磁盘上创建分层缓存。"""
-        if not self.local_cache_path:
-            raise ValueError("`fedspeed.model_cache_path` must be specified for local-reconstruct mode.")
-        
+        logger.info("Priming Reconstructor's CPU cache from local disk cache for all modes...")
         model_specific_cache_path = os.path.join(self.local_cache_path, self.sanitized_model_name)
-        done_file = os.path.join(model_specific_cache_path, ".creation_done")
-        if os.path.exists(done_file):
-            logger.info(f"Rank {self.rank}: Layer-wise cache already exists at {self.local_cache_path}")
-            return
+        if not os.path.exists(model_specific_cache_path):
+            raise FileNotFoundError(f"The required model cache path '{model_specific_cache_path}' does not exist.")
             
-        logger.info(f"Rank {self.rank}: Creating layer-wise cache at {self.local_cache_path}...")
-        os.makedirs(self.local_cache_path, exist_ok=True)
+        offline_state_dict = {}
+        for internal_name, _ in self.model.state_dict(return_trainable=False).items():
+            
+            # 用于查找文件的名称 (不带 'model.' 前缀)
+            key_for_filename = internal_name
+            if key_for_filename.startswith('model.'):
+                key_for_filename = key_for_filename[len('model.'):]
+            
+            param_filename = key_for_filename + ".npy"
+            file_path = os.path.join(model_specific_cache_path, param_filename)
+            
+            if os.path.exists(file_path):
+                # 存入缓存时，使用模型内部的权威名称 (带前缀)
+                offline_state_dict[internal_name] = torch.from_numpy(np.load(file_path))
+            # 对于找不到的文件，不再打印警告，因为 _set_initial_param_status 会处理
         
-        num_frozen_params_saved = 0
-        for name, param in self.model.named_parameters():
-            # 归一化客户端的长名称，以匹配 state_dict 的 key
-            key_in_state_dict = name
-            if key_in_state_dict.startswith("base_model.model."):
-                key_in_state_dict = key_in_state_dict[len("base_model.model."):]
-            if key_in_state_dict.startswith("model."):
-                    key_in_state_dict = key_in_state_dict[len("model."):]
-            
-            # 确保这个冻结参数在服务器发来的 state_dict 中存在
-            if key_in_state_dict in state_dict:
-                param_data_to_save = state_dict[key_in_state_dict]
-                param_filename = key_in_state_dict + ".npy"
-                full_path = os.path.join(model_specific_cache_path, param_filename)
-                os.makedirs(os.path.dirname(full_path), exist_ok=True)
-                # 将 PyTorch 张量转换为 NumPy 数组
-                numpy_array = param_data_to_save.cpu().numpy()
-                np.save(full_path, numpy_array)
-                num_frozen_params_saved += 1
+        if not offline_state_dict:
+             raise ValueError("No parameter files were found in the cache path.")
+             
+        self.reconstructor.prime_cpu_cache(offline_state_dict)
+        logger.info(f"Reconstructor's CPU cache primed with {len(offline_state_dict)} parameters.")
 
-        with open(done_file, 'w') as f: f.write('done')
-        logger.info(f"Rank {self.rank}: Successfully created cache for {num_frozen_params_saved} frozen parameters.")
+    def _set_initial_param_status(self):
+        """
+        【最终版 v3】一个统一的函数，为所有模式的所有参数设置正确的初始状态。
+        能够正确处理所有模式下的 LoRA 参数和基础参数。
+        """
+        # 1. 获取所有参数的权威 state_dict
+        #    这既提供了权威的名称，也提供了对 param 对象的引用
+        full_state_dict_with_refs = self.model.state_dict(return_trainable=False)
+        
+        # 2. 创建一个从名称到 param 对象的快速查找字典
+        #    named_parameters() 的名称可能与 state_dict 不一致，我们需要一个映射
+        param_map_from_named_params = {name: p for name, p in self.model.named_parameters()}
+        
+        with torch.no_grad():
+            # 3. 遍历 state_dict 的 keys，这是我们的权威名称
+            for name in full_state_dict_with_refs.keys():
+                # 尝试从 named_parameters 中找到对应的 param 对象
+                param = param_map_from_named_params.get(name)
+                if param is None:
+                    # state_dict 可能包含 buffer 等非 parameter，跳过它们
+                    continue
+
+                # --- 分模式设置状态 ---
+                if self.aggregation_mode in ['local-reconstruct', 'shardedGradient']:
+                    # --- Path A: Offloading 模式 ---
+                    if self.aggregation_mode == 'shardedGradient':
+                        if param.requires_grad: # 可训练参数 (LoRA)
+                            param.fedspeed_status = "PARTIAL_PERSISTENT"
+                        else: # 冻结参数
+                            param.fedspeed_status = "IN_CPU_CACHE"
+                    else: # local-reconstruct
+                        if param.requires_grad:
+                            param.fedspeed_status = "FULL_PERSISTENT"
+                            # 将可训练参数 (LoRA) 直接加载到 GPU (使用其随机初始值)
+                            param.data = param.data.to(self.device) 
+                        else:
+                            param.fedspeed_status = "IN_CPU_CACHE"
+                
+                else:
+                    # --- Path B: In-Memory 模式 (model, fl-sim, gradient) ---
+                    if param.requires_grad:
+                        # --- 核心修复 ---
+                        # 可训练参数 (LoRA) 是即时创建的，不需要从缓存加载。
+                        # 它们本身就是完整的，应该持久化在 GPU。
+                        param.fedspeed_status = "FULL_PERSISTENT"
+                        # 确保它们在正确的设备上 (通常 get_llm 已经处理了)
+                        param.data = param.data.to(self.device)
+                        # --- 结束核心修复 ---
+                    else:
+                        # 冻结参数 (基础模型) 是分片的，需要网络重建
+                        param.fedspeed_status = "SHARDED"
+                        # 为其创建 CPU 上的分片副本
+                        if self.reconstructor and name in self.reconstructor.cpu_cache:
+                            full_param_cpu = self.reconstructor.cpu_cache[name]
+                            
+                            sharding_info = self.sharding_metadata.get(name)
+                            if sharding_info:
+                                my_rank_info = sharding_info['ranks_info'][self.rank]
+                                offset, size = my_rank_info['offset'], my_rank_info['size']
+                                shard_data = full_param_cpu.narrow(sharding_info['split_dim'], offset, size).clone()
+                                param.fedspeed_shard = torch.nn.Parameter(shard_data, requires_grad=False)
+                            else:
+                                 param.fedspeed_shard = torch.nn.Parameter(torch.empty(0, dtype=param.dtype), requires_grad=False)
+                        else:
+                            logger.warning(f"Frozen param '{name}' not found in cache for sharding. Creating an empty shard.")
+                            param.fedspeed_shard = torch.nn.Parameter(torch.empty(0, dtype=param.dtype), requires_grad=False)
+
+
+                # 通用清理：确保不在 GPU 上的参数的 .data 为空
+                if 'PERSISTENT' not in param.fedspeed_status:
+                     if param.data.numel() > 0:
+                        param.data = torch.empty(0, dtype=param.dtype, device=self.device)
+
+    def _initialize_with_reconstructor(self):
+        """
+        为 Offloading 模式 (`local-reconstruct`, `shardedGradient`) 进行初始化。
+        【最终版：确保 LoRA 参数被添加到 CPU 缓存】
+        """
+        # 1. 创建 Reconstructor
+        self.reconstructor = PipelinedReconstructor(self, self.name_to_param_map, self.sanitized_model_name)
+        
+        # 2. 从本地磁盘加载【基础模型】数据到 Reconstructor 的 CPU 缓存
+        self._prime_reconstructor_cpu_cache() # 这个函数现在只负责从磁盘加载
+
+        # --- START OF FINAL FIX ---
+        # 3. 【关键】对于 shardedGradient 模式，将内存中新创建的 LoRA 参数手动添加到 CPU 缓存
+        if self.aggregation_mode == 'shardedGradient':
+            logger.info("Injecting newly created LoRA parameters into the CPU cache for shardedGradient mode...")
+            num_injected = 0
+            with torch.no_grad():
+                for name, param in self.model.named_parameters():
+                    if param.requires_grad: # 识别可训练参数 (LoRA)
+                        param.fedspeed_status = "PARTIAL_PERSISTENT"
+                        if name not in self.reconstructor.cpu_cache:
+                            # 将参数的 .data 复制到CPU，然后存入缓存
+                            self.reconstructor.cpu_cache[name] = param.data.cpu().clone()
+                            num_injected += 1
+            logger.info(f"Injected {num_injected} LoRA parameters into the CPU cache.")
 
     def _build_param_to_layer_index_map(self):
         """
@@ -555,49 +567,6 @@ class FedSpeedEngine:
             module.fedspeed_id = module_counter
             module_counter += 1
 
-    def _set_initial_param_status(self):
-        """
-        【新重构函数】根据模式为所有参数设置初始状态。
-        """
-        with torch.no_grad():
-            for name, param in self.model.named_parameters():
-                param.fedspeed_name = name
-                if self.aggregation_mode != "model":
-                    param.fedspeed_original_shape = param.shape
-                
-                # --- 分模式设置状态 ---
-                if self.aggregation_mode == 'shardedGradient':
-                    if param.requires_grad and name in self.sharding_metadata:
-                        param.fedspeed_status = "PARTIAL_PERSISTENT"
-                    else:
-                        param.fedspeed_status = "IN_CPU_CACHE"
-
-                elif self.aggregation_mode == 'local-reconstruct':
-                    if param.requires_grad:
-                        # 在此模式下，可训练参数被完整地持久化在 GPU
-                        param.fedspeed_status = "FULL_PERSISTENT"
-                        # 需要从 CPU 缓存加载到 GPU
-                        if self.reconstructor and name in self.reconstructor.cpu_cache:
-                            param.data = self.reconstructor.cpu_cache[name].to(self.device)
-                    else:
-                        param.fedspeed_status = "IN_CPU_CACHE"
-
-                elif self.aggregation_mode in ['model', 'fl-sim']:
-                    # 在这些模式下，状态已经在 _load_shards_and_build_maps 中通过
-                    # param.fedspeed_status = "FULL_PERSISTENT" 或 "SHARDED" 设置好了
-                    pass # 不需要额外操作
-
-                else: # 'gradient'
-                    if not hasattr(param, 'fedspeed_status'):
-                         param.fedspeed_status = "SHARDED"
-                
-                # --- 通用操作 ---
-                # 只有在 data 仍然为空时才清空
-                if param.data.numel() == 0:
-                    param.data = torch.empty(0, dtype=param.dtype, device=self.device)
-                
-                self.id_to_param_map[id(param)] = param
-
     def _build_module_param_map(self):
         """
         这个函数现在只负责构建映射，它依赖于事先附加好的持久化 ID。
@@ -620,6 +589,13 @@ class FedSpeedEngine:
         """
         根据 aggregation_mode 初始化相应的优化器和参数缓冲区。
         """        
+        # 遍历一次所有参数，附加通用属性并构建 id_to_param_map
+        self.id_to_param_map.clear()
+        for name, param in self.model.named_parameters():
+            param.fedspeed_name = name
+            param.fedspeed_original_shape = param.shape
+            self.id_to_param_map[id(param)] = param
+
         # --- 根据模式进行不同的初始化 ---
         if self.aggregation_mode == 'gradient':
             self._initialize_for_gradient_aggregation()
@@ -700,28 +676,37 @@ class FedSpeedEngine:
 
             my_rank_info = param_sharding_info['ranks_info'].get(self.rank)
             if my_rank_info and my_rank_info['size'] > 0:
-                # 1. 从 Reconstructor 的 CPU 缓存中获取【完整】的参数张量
-                if name not in self.reconstructor.cpu_cache:
-                    logger.error(f"Full parameter for '{name}' not found in CPU cache. Cannot create shard.")
-                    continue
-                full_param_cpu = self.reconstructor.cpu_cache[name]
 
-                # 从完整参数张量中创建一个视图(view)
+                is_lora_param = 'lora_' in name.lower()
+
+                if is_lora_param:
+                    # 1. 路径 A: LoRA 参数 (即时创建的随机权重)
+                    # 从模型实例的 .data 属性获取完整的参数张量 (这是随机初始化的值)
+                    # 确保它在 GPU 上
+                    full_param_source = param.data.to(self.device).clone() 
+                    
+                elif name in self.reconstructor.cpu_cache:
+                    # 2. 路径 B: 非 LoRA 可训练参数 (例如，Bias，或者全参数训练中的所有参数)
+                    # 从 Reconstructor 的 CPU 缓存中获取完整的参数张量
+                    full_param_cpu = self.reconstructor.cpu_cache[name]
+                    # 确保数据被复制到 GPU
+                    full_param_source = full_param_cpu.to(self.device)
+                else:
+                    logger.error(f"Full parameter for '{name}' not found in CPU cache or is not a LORA param. Cannot create shard.")
+                    continue
+                
+                # --- 核心切分逻辑 ---
                 split_dim = param_sharding_info['split_dim']
                 offset = my_rank_info['offset']
                 size = my_rank_info['size']
                 
-                # 确保 offset 和 size 在 full_param_cpu 的范围内
-                if offset + size > full_param_cpu.shape[split_dim]:
-                    logger.error(f"Sharding info for '{name}' is out of bounds for the tensor shape {full_param_cpu.shape}.")
-                    continue
-
-                shard_cpu_view = full_param_cpu.narrow(split_dim, offset, size)
+                # 从完整参数张量中创建一个视图(view)作为我的分片
+                shard_data_gpu_view = full_param_source.narrow(split_dim, offset, size)
                 
                 # 将这个视图变成一个需要梯度的 Parameter 对象，以便优化器管理
-                shard_data_gpu = shard_cpu_view.clone().to(self.device)
-                shard_param_for_optim = torch.nn.Parameter(shard_data_gpu)
-                shard_param_for_optim.fedspeed_name = name # 附加原始名称
+                # 需要 clone() 避免视图问题
+                shard_param_for_optim = torch.nn.Parameter(shard_data_gpu_view.clone())
+                shard_param_for_optim.fedspeed_name = name 
                 
                 my_shard_param_views.append(shard_param_for_optim)
                 self._my_persistent_shards[name] = shard_param_for_optim
@@ -734,6 +719,10 @@ class FedSpeedEngine:
         # 创建一个只作用于这些分片视图的优化器
         self.local_optimizer = get_optimizer(my_shard_param_views, **self.cfg.train.optimizer)
         logger.info(f"Rank {self.rank}: Sharded optimizer created, managing {len(my_shard_param_views)} parameter shards.")
+
+        # 如果开启了两阶段，则确定第一阶段要训练的参数【名称】
+        if self.two_stage:
+            self._partition_trainable_params_for_stage1()
 
     def _partition_trainable_params_for_stage1(self):
         """
@@ -756,6 +745,11 @@ class FedSpeedEngine:
         #    例如，12 个块分给 3 个客户端
         block_indices = torch.arange(num_blocks)
         block_chunks = torch.chunk(block_indices, self.world_size)
+        self.layer_idx_to_owner_rank_map = {}
+        for owner_rank, indices_tensor in enumerate(block_chunks):
+            for layer_idx in indices_tensor.tolist():
+                self.layer_idx_to_owner_rank_map[layer_idx] = owner_rank
+        logger.info(f"Built layer-to-owner-rank map: {self.layer_idx_to_owner_rank_map}")
         my_block_indices = block_chunks[self.rank]
         
         # 3. 获取分配给当前 rank 的逻辑块实例
@@ -823,6 +817,7 @@ class FedSpeedEngine:
                             logger.error("LocalReconstructor not initialized. Cannot perform local reconstruction.")
                             return
                         param_name = param.fedspeed_name
+                        logger.debug(f"load param from cache: {param_name}")
                         full_param_gpu = self.reconstructor.load_param(param_name)
                         my_latest_shard = self._my_persistent_shards[param_name]
                         
@@ -913,11 +908,15 @@ class FedSpeedEngine:
 
     def _post_forward_hook_fn(self, module, inputs, outputs):
         """在前向传播离开一个子模块之后，立即丢弃不再使用的参数。"""
+        if not self.model.training:
+            # 如果是评估模式 (model.eval())，则不执行任何参数释放或预取
+            return
+    
         logger.debug(f"[POST-FWD HOOK @ Rank {self.rank}] For {type(module).__name__}")
-
+        
         # 1. 参数释放
-        # if self.aggregation_mode == 'model':
-        #     self._release_all_full_params()
+        if self.aggregation_mode == 'model':
+            self._release_all_full_params()
         if self.aggregation_mode == 'gradient':
             param_ids_in_module = self.module_to_params_map.get(id(module), [])
             current_ref_counter = self.param_recompute_ref_count if self.is_recomputing else self.param_fwd_ref_count
@@ -990,11 +989,15 @@ class FedSpeedEngine:
 
     def _post_backward_hook_fn(self, module, grad_input, grad_output):
         """在反向传播离开一个子模块之后，立即丢弃不再使用的参数。"""
+        if not self.model.training:
+            # 如果是评估模式 (model.eval())，则不执行任何参数释放或预取
+            return
+            
         logger.debug(f"[POST-BWD HOOK @ Rank {self.rank}] For {type(module).__name__}")
 
         # 1. 参数释放
-        # if self.aggregation_mode == 'model':
-        #     self._release_all_full_params()
+        if self.aggregation_mode == 'model':
+            self._release_all_full_params()
         if self.aggregation_mode == 'gradient':
             param_ids_in_module = self.module_to_params_map.get(id(module), [])
             current_ref_counter = self.param_recompute_ref_count if self.is_recomputing else self.param_bwd_ref_count
@@ -1045,6 +1048,10 @@ class FedSpeedEngine:
             self.reconstructor.param_name_to_exec_idx = param_name_to_exec_idx
             logger.info(f"Dynamically built execution order with {len(self._execution_order)} modules.")
 
+            # 3. 如果开启了两阶段，则确定第一阶段要训练的参数【名称】
+            # if self.two_stage:
+            #     self._partition_trainable_params_for_stage1()
+
         # 释放参数
         if self.aggregation_mode == 'gradient':
             self._release_all_full_params()
@@ -1078,7 +1085,7 @@ class FedSpeedEngine:
         """
         使用 all_reduce + 本地切片的方式，兼容 gloo 后端。
         """
-        if self.aggregation_mode in ['model', 'local-reconstruct', 'fl-sim']:
+        if self.aggregation_mode != 'gradient':
             # 在模型聚合模式下，梯度只在本地使用，不进行分布式聚合
             return None 
         else:
@@ -1179,7 +1186,7 @@ class FedSpeedEngine:
             trainable_params = self.local_optimizer.param_groups[0]['params']
             params_to_send_vec = parameters_to_vector([p.data for p in trainable_params]).clone()
             self.aggregation_timer.stop()
-            
+
             # 清理未使用的缓存内存
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -1226,80 +1233,6 @@ class FedSpeedEngine:
         vector_to_parameters(self.fp32_master_param_shard.data, shards_to_update)
 
         # 4. 清理未使用的缓存内存
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        logger.debug(f"Rank {self.rank}: Optimizer step finished. Model shards updated.")
-        
-    def _model_aggregation_step(self):
-        """
-        【可训练参数不分片版】根据步数，条件性地执行聚合。
-        """
-        if not self.local_optimizer: return
-
-        # --- 阶段性梯度处理 ---
-        if self.two_stage and self.current_step < self.stage_one_steps:
-            # --- 第一阶段：梯度掩码 ---
-            with torch.no_grad():
-                # 遍历优化器管理的所有参数
-                for param in self.local_optimizer.param_groups[0]['params']:
-                    # 找到参数的全局名称
-                    param_name = param.fedspeed_name # 假设 param 对象有这个属性
-                    
-                    # 如果这个参数不属于本地子集，则将其梯度清零
-                    if param_name not in self.local_trainable_names_stage1:
-                        if param.grad is not None:
-                            param.grad.zero_()
-
-        # 1. 本地更新
-        # 梯度已经在 backward 过程中被附加到了【完整】可训练参数上，直接调用优化器执行一步本地更新
-        self.local_optimizer.step()
-        self.local_optimizer.zero_grad()
-        self.current_step += 1
-        
-        # 打印内存占用
-        if self.current_step == 1:
-            self.profile_sharded_memory()
-
-        # 2. 检查是否需要聚合
-        self.should_aggregate = False
-        if self.two_stage:
-            if self.current_step == self.stage_one_steps:
-                # 阶段转换点，强制聚合
-                self.should_aggregate = True
-                logger.info(f"--- [Stage Transition] Aggregating at Step #{self.current_step} ---")
-            elif self.current_step > self.stage_one_steps and self.current_step % self.aggregation_steps == 0:
-                # 第二阶段，按频率聚合
-                self.should_aggregate = True
-                logger.info(f"--- [Stage 2] Aggregating at Step #{self.current_step} ---")
-            # else: 第一阶段，不聚合
-        else: # 非两阶段模式
-             if self.current_step % self.aggregation_steps == 0:
-                 self.should_aggregate = True
-                 logger.info(f"--- [FedSpeed-Model] Aggregating at Step #{self.current_step} ---")
-
-        if self.should_aggregate:      
-            self.aggregation_timer.start()      
-            # a. 将本地更新后的【完整】可训练参数打包成一个向量
-            trainable_params_in_order = self.local_optimizer.param_groups[0]['params']
-            updated_local_full_params_vec = parameters_to_vector(
-                [p.data for p in trainable_params_in_order]
-            )
-
-            # b. 对该向量进行 all-reduce 平均 (SUM + DIV)
-            dist.all_reduce(updated_local_full_params_vec, op=dist.ReduceOp.SUM)
-            if self.world_size > 0:
-                updated_local_full_params_vec.div_(self.world_size)
-
-            # c. 将聚合后的参数写回到模型中
-            vector_to_parameters(updated_local_full_params_vec, trainable_params_in_order)
-
-            # 聚合后重置优化器
-            # self._initialize_for_model_aggregation()
-
-            self.aggregation_timer.stop()
-
-        # 3. 清理未使用的缓存内存
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -1426,8 +1359,7 @@ class FedSpeedEngine:
 
                 # 阶段一不广播参数，返回空值
                 return [], False
-
-        # --- 阶段二 或 非分组模式：按参数分片更新 (你已有的逻辑) ---
+        # --- 阶段二 ---
         else:
             # 优化器更新
             updated_shards_for_broadcast = []
@@ -1505,6 +1437,72 @@ class FedSpeedEngine:
             self.aggregation_timer.stop()
 
             return updated_shards_for_broadcast, model_was_updated_by_peers
+
+    def sync_model_layers_via_broadcast(self):
+        """
+        通过逐层广播的方式，同步在阶段一由不同客户端训练的参数层。
+        """
+        logger.info(f"Rank {self.rank}: Starting layer-wise model synchronization via Broadcast...")
+
+        # 确保我们有用于阶段一的完整优化器
+        optimizer = self.local_optimizer
+            
+        if not optimizer:
+            logger.error("Cannot perform layer-wise sync: No valid full-parameter optimizer found.")
+            return
+        
+        # 获取所有可训练参数的 map
+        trainable_params_map = {p.fedspeed_name: p for p in optimizer.param_groups[0]['params']}
+        
+        with torch.no_grad():
+            # 1. 确定每个客户端负责的层 (这个逻辑需要从 _partition_trainable_params_for_stage1 中获取)
+            #    我们假设 _partition_... 函数已经被调用，并且 self.local_trainable_names_stage1 已经填充
+            
+            # 2. 遍历所有逻辑层
+            for layer_idx, layer_name in enumerate(self.logical_layers_names):
+                # a. 确定这一层的广播源 (src_rank)
+                src_rank = self.layer_idx_to_owner_rank_map.get(layer_idx)
+                if src_rank is None:
+                    logger.warning(f"Could not find owner rank for layer {layer_idx}. Skipping sync for this layer.")
+                    continue
+                
+                # b. 将该层的所有参数打包成一个向量
+                layer_params = []
+                for name, p in self.name_to_param_map.items():
+                    if self._param_to_layer_index_map.get(name) == layer_idx and p.requires_grad:
+                        # 确保我们使用的是优化器中管理的那个最新的参数对象
+                        if name in trainable_params_map:
+                             layer_params.append(trainable_params_map[name])
+
+                if not layer_params:
+                    continue
+
+                # 创建一个正确大小的缓冲区来发送/接收
+                vec_size = sum(p.numel() for p in layer_params)
+                if vec_size == 0: continue
+                layer_vec = torch.empty(vec_size, dtype=layer_params[0].dtype, device=self.device)
+                
+                # c. 如果我是广播源，我填充缓冲区
+                if self.rank == src_rank:
+                    # 从我的最新参数中填充
+                    vector_to_parameters(parameters_to_vector([p.data for p in layer_params]), [layer_vec]) # 这是一个小技巧
+                
+                # d. 执行广播
+                dist.broadcast(layer_vec, src=src_rank, group=self.comm_group)
+
+                # e. 【所有客户端】用收到的向量来更新自己的相应参数层
+                vector_to_parameters(layer_vec, layer_params)
+
+            # 3. 将同步后的最新参数，也写回到 CPU 缓存
+            if self.reconstructor:
+                logger.info(f"Rank {self.rank}: Updating CPU cache with layer-wise synchronized parameters.")
+                for param in optimizer.param_groups[0]['params']:
+                    if param.fedspeed_name in self.reconstructor.gpu_cache:
+                        self.reconstructor.gpu_cache[param.fedspeed_name].copy_(param.data.cpu())
+                    if param.fedspeed_name in self.reconstructor.cpu_cache:
+                        self.reconstructor.cpu_cache[param.fedspeed_name].copy_(param.data.cpu())
+        
+        logger.info(f"Rank {self.rank}: Layer-wise model synchronization complete.")
 
     def sync_model_at_stage_transition(self):
         """
@@ -1591,6 +1589,10 @@ class FedSpeedEngine:
                     
                     # a. 更新我的持久化分片 (如果我负责这个参数)
                     if name in self._my_persistent_shards:
+                        sharding_info = self.sharding_metadata.get(name)
+                        if not sharding_info:
+                            logger.warning(f"Sharding metadata for '{name}' not found during sync. Skipping shard update.")
+                            continue
                         my_rank_info = sharding_info['ranks_info'][self.rank]
                         offset, size = my_rank_info['offset'], my_rank_info['size']
                         
@@ -1659,7 +1661,7 @@ class FedSpeedEngine:
             
             if should_aggregate_now:
                 self.aggregation_timer.start()
-                logger.info(f"[Stage 1] Aggregation step. Preparing to dispatch layer gradients.")
+                logger.debug(f"[Stage 1] Aggregation step. Preparing to dispatch layer gradients.")
                 # 将梯度按层分组
                 grads_by_layer = {i: {} for i in range(len(self.logical_layers_names))}
                 for name, grad in self.temp_full_gradients.items():
@@ -1735,34 +1737,35 @@ class FedSpeedEngine:
                         my_local_grad_shards[name] = grad_shard
                     else:
                         # 这是需要发给别人的分片
-                        if self.aggregation_steps > 1:
-                            # 多步模式：存入累加器
-                            target_rank = rank_idx
-                            if target_rank not in self.remote_grad_accumulator:
-                                self.remote_grad_accumulator[target_rank] = {}
-                            if name not in self.remote_grad_accumulator[target_rank]:
-                                self.remote_grad_accumulator[target_rank][name] = {
-                                    'sum': torch.zeros_like(grad_shard), 'count': 0,
+                        if self.should_aggregate:
+                            if self.aggregation_steps > 1:
+                                # 多步模式：存入累加器
+                                target_rank = rank_idx
+                                if target_rank not in self.remote_grad_accumulator:
+                                    self.remote_grad_accumulator[target_rank] = {}
+                                if name not in self.remote_grad_accumulator[target_rank]:
+                                    self.remote_grad_accumulator[target_rank][name] = {
+                                        'sum': torch.zeros_like(grad_shard), 'count': 0,
+                                        'step': self.current_step
+                                        }
+                                self.remote_grad_accumulator[target_rank][name]['sum'].add_(grad_shard)
+                                self.remote_grad_accumulator[target_rank][name]['count'] += 1
+                                self.remote_grad_accumulator[target_rank][name]['step'] = self.current_step
+                            else:
+                                self.aggregation_timer.start()
+                                dispatch_content = {
+                                    'param_name': name,
+                                    'grad_shard_data': grad_shard.cpu().clone(),
+                                    'source_rank': self.rank,
                                     'step': self.current_step
-                                    }
-                            self.remote_grad_accumulator[target_rank][name]['sum'].add_(grad_shard)
-                            self.remote_grad_accumulator[target_rank][name]['count'] += 1
-                            self.remote_grad_accumulator[target_rank][name]['step'] = self.current_step
-                        else:
-                            self.aggregation_timer.start()
-                            dispatch_content = {
-                                'param_name': name,
-                                'grad_shard_data': grad_shard.cpu().clone(),
-                                'source_rank': self.rank,
-                                'step': self.current_step
-                            }
-                            target_client_id = self.rank_to_client_id_map.get(rank_idx)
+                                }
+                                target_client_id = self.rank_to_client_id_map.get(rank_idx)
 
-                            # 将这个分片内容添加到对应目标rank的列表中
-                            if target_client_id not in grouped_shards_to_dispatch:
-                                grouped_shards_to_dispatch[target_client_id] = []
-                            grouped_shards_to_dispatch[target_client_id].append(dispatch_content)
-                            self.aggregation_timer.stop()
+                                # 将这个分片内容添加到对应目标rank的列表中
+                                if target_client_id not in grouped_shards_to_dispatch:
+                                    grouped_shards_to_dispatch[target_client_id] = []
+                                grouped_shards_to_dispatch[target_client_id].append(dispatch_content)
+                                self.aggregation_timer.stop()
             
             self.temp_full_gradients.clear()
 
@@ -1853,11 +1856,10 @@ class FedSpeedEngine:
                 logger.warning("Received incomplete parameter shard update. Ignoring.")
                 return
 
-            if param_name not in self._my_persistent_shards:
-                sharding_info = self.sharding_metadata.get(param_name)
-                if sharding_info:
-                    self.reconstructor.update_cache(param_name, shard_data, sharding_info, source_rank)
-                    logger.debug(f"Rank {self.rank}: Updated CPU cache for '{param_name}' with shard from rank {source_rank}.")
+            sharding_info = self.sharding_metadata.get(param_name)
+            if sharding_info:
+                self.reconstructor.update_cache(param_name, shard_data, sharding_info, source_rank)
+                logger.debug(f"Rank {self.rank}: Updated cache for '{param_name}' with shard from rank {source_rank}.")
 
     def update_model(self, received_params_vec: torch.Tensor):
         """由 Trainer 调用的、用于【同步】更新的方法。"""
@@ -1897,12 +1899,12 @@ class FedSpeedEngine:
                     full_param = None
                     
                     # # --- 优先尝试从 GPU 缓存获取 ---
-                    # if name in self.reconstructor.gpu_cache:
-                    #     # 从 GPU 缓存获取，需要 clone 以免修改缓存中的原始数据
-                    #     full_param = self.reconstructor.gpu_cache[name].clone()
-                    #     logger.debug(f"Getting param '{name}' from GPU cache.")
+                    if name in self.reconstructor.gpu_cache:
+                        # 从 GPU 缓存获取，需要 clone 以免修改缓存中的原始数据
+                        full_param = self.reconstructor.gpu_cache[name].clone()
+                        logger.debug(f"Getting param '{name}' from GPU cache.")
                     # --- 回退到 CPU 缓存 ---
-                    if name in self.reconstructor.cpu_cache:
+                    elif name in self.reconstructor.cpu_cache:
                         # 从 CPU 缓存获取，需要 clone
                         full_param = self.reconstructor.cpu_cache[name].clone()
                         logger.debug(f"Getting param '{name}' from CPU cache.")
@@ -2013,7 +2015,7 @@ class FedSpeedEngine:
         # ... (可以扩展其他函数)
         else: # 'constant'
             return initial_alpha
-
+        
     def profile_sharded_memory(self):
         """计算各类分片化状态的内存占用。"""
         if not torch.cuda.is_available():
@@ -2138,152 +2140,69 @@ class FedSpeedCoordinatorEngine:
         核心方法：执行分片和演练，返回所有客户端的初始化数据包。
         根据 config.federate.aggregation_mode 采取不同的打包策略。
         """
-        logger.info(f"[Coordinator] Starting parameter sharding and reference count profiling for world_size={self.world_size}...")
+        logger.info(f"[Coordinator] Preparing metadata packages for world_size={self.world_size}...")
 
-        # --- 1. 获取配置 ---
+        # --- 1. 获取通用配置 ---
         aggregation_mode = self.cfg.federate.get('aggregation_mode', 'gradient')
-        use_offline_model = self.cfg.federate.get('use_offline_model', False)
         noniid = self.cfg.federate.two_stages.get('noniid', False)
 
-        # --- 2. 演练引用计数 (基础梯度模式) ---
-        # 引用计数与模型如何分发无关，只与计算图有关，所以可以先计算
-        ref_counts_package = None
-        if aggregation_mode == 'gradient':
-            ref_counts_package = self._profile_ref_counts()
-
-        # --- 3. 计算分组元数据 (如果启用) ---
-        grouping_metadata = {}
-        logger.info(f"noniid: {noniid}")
-        if noniid:
-            # 在执行任何操作前，确保模块有全局名称
-            grouping_metadata = self._calculate_grouping_and_layer_assignments()
-
-        # --- 4. 根据不同的聚合模式，准备不同的数据包内容 ---
+        # --- 2. 计算所有客户端共享的元数据 ---
         
-        # --- Case A: 新的去中心化分片FedAvg模式 ---
-        if aggregation_mode == 'shardedGradient':
-            logger.info(f"[Coordinator] Mode: 'shardedGradient'. Preparing full params and sharding metadata.")
-            sharding_metadata = OrderedDict()
-            full_model_state_dict_for_cache = OrderedDict()
+        # a. 引用计数 (只在 'gradient' 模式下需要)
+        ref_counts_package = self._profile_ref_counts() if aggregation_mode == 'gradient' else None
 
+        # b. 分组元数据 (如果启用)
+        grouping_metadata = self._calculate_grouping_and_layer_assignments() if noniid else {}
+
+        # c. 分片元数据 (只在 'shardedGradient' 和 'gradient' 模式下需要)
+        sharding_metadata = OrderedDict()
+        if aggregation_mode in ['shardedGradient', 'gradient']:
+            logger.info(f"[Coordinator] Mode: '{aggregation_mode}'. Preparing sharding metadata.")
             with torch.no_grad():
                 for name, param in self.model.named_parameters():
-                    if param.requires_grad:
-                        # 计算层内分片元数据
-                        dim_to_split = 0 # 默认切分第一个维度
-                        dim_size = param.shape[dim_to_split]
-
-                        if dim_size < self.world_size:
-                            logger.warning(f"Trainable param '{name}' dim 0 size ({dim_size}) is smaller than world_size "
-                                         f"({self.world_size}). It will not be sharded effectively.")
-                            split_sizes = [dim_size] + [0] * (self.world_size - 1)
-                        else:
-                            split_sizes = self._get_even_split_sizes(dim_size)
-                        
-                        offsets = [0] + list(np.cumsum(split_sizes)[:-1])
-                        
-                        sharding_metadata[name] = {
-                            'split_dim': dim_to_split,
-                            'ranks_info': {
-                                rank: {'size': int(size), 'offset': int(offset)} # 确保为原生 int
-                                for rank, (size, offset) in enumerate(zip(split_sizes, offsets))
-                            }
-                        }
-
-                # 2. 准备一个【完整模型】的 state_dict，用于让客户端在本地创建缓存
-                if not use_offline_model:
-                    for name, param in self.model.named_parameters():
-                        # 归一化名称
-                        normalized_name = name
-                        if normalized_name.startswith("base_model.model."):
-                            normalized_name = normalized_name[len("base_model.model."):]
-                        if normalized_name.startswith("model."):
-                            normalized_name = normalized_name[len("model."):]
-                        full_model_state_dict_for_cache[normalized_name] = param.cpu().clone()
-
-            # 为此模式下的所有客户端准备相同的包内容
-            package_content = {
-                'sharding_metadata': sharding_metadata,
-                'full_model_state_dict': full_model_state_dict_for_cache
-            }
-            all_client_packages_content = [package_content] * self.world_size
-
-        # --- Case B: 本地重建模式 (CPU/Disk Offloading) ---
-        elif aggregation_mode == 'local-reconstruct':
-            logger.info(f"[Coordinator] Mode: 'local-reconstruct'. Preparing full model state_dict.")
-            final_state_dict_to_send = OrderedDict()
-            if not use_offline_model:
-                for name, param in self.model.named_parameters():
-                    # 归一化名称以供客户端查找
-                    normalized_name = name
-                    if normalized_name.startswith("base_model.model."):
-                        normalized_name = normalized_name[len("base_model.model."):]
-                    if normalized_name.startswith("model."):
-                        normalized_name = normalized_name[len("model."):]
-                    final_state_dict_to_send[normalized_name] = param.cpu().clone()
-            
-            package_content = {'full_model_state_dict': final_state_dict_to_send}
-            all_client_packages_content = [package_content] * self.world_size
-
-        # --- Case C: 其他模式 (如 'gradient', 'model', 'fl-sim') ---
-        else:
-            logger.info(f"[Coordinator] Mode: '{aggregation_mode}'. Preparing parameter shards for each client.")
-            all_param_shards = {rank: {} for rank in range(self.world_size)}
-            with torch.no_grad():
-                for name, param in self.model.named_parameters():
+                    # 只为可训练参数或冻结的分片参数计算元数据
                     is_trainable = param.requires_grad
-                    should_shard_this_param = True
-                    
-                    if aggregation_mode == 'fl-sim':
-                        should_shard_this_param = False # fl-sim 不分片
-                    elif is_trainable and aggregation_mode == 'model':
-                        should_shard_this_param = False # 'model' 模式的可训练参数不分片
-                    
-                    if not should_shard_this_param:
-                        # 不分片，每个客户端获得一个完整副本
-                        for rank in range(self.world_size):
-                            all_param_shards[rank][name] = {
-                                'shard_data': param.data.clone(),
-                                'original_shape': param.shape,
-                                'is_trainable': is_trainable,
-                                'is_sharded': False
-                            }
+                    # 在 'gradient' 模式下，所有参数都分片；
+                    # 在 'shardedGradient' 模式下，只有可训练参数分片
+                    should_shard = (aggregation_mode == 'gradient' or 
+                                    (aggregation_mode == 'shardedGradient' and is_trainable))
+                                    
+                    if not should_shard:
+                        continue
+
+                    dim_to_split = 0
+                    dim_size = param.shape[dim_to_split]
+
+                    if dim_size < self.world_size:
+                        split_sizes = [dim_size] + [0] * (self.world_size - 1)
                     else:
-                        # 执行层内分片
-                        dim_to_split = 0
-                        dim_size = param.shape[dim_to_split]
-                        
-                        if dim_size == 0:
-                            shards = [torch.empty(0, dtype=param.dtype) for _ in range(self.world_size)]
-                        elif dim_size < self.world_size:
-                            shards = [param.data.clone() if r == 0 else torch.empty(0, dtype=param.dtype) for r in range(self.world_size)]
-                        else:
-                            split_sizes = self._get_even_split_sizes(dim_size)
-                            shards = torch.split(param.data, split_sizes, dim=dim_to_split)
+                        split_sizes = self._get_even_split_sizes(dim_size)
+                    
+                    offsets = [0] + list(np.cumsum(split_sizes)[:-1])
+                    
+                    sharding_metadata[name] = {
+                        'split_dim': dim_to_split,
+                        'ranks_info': {
+                            rank: {'size': int(size), 'offset': int(offset)}
+                            for rank, (size, offset) in enumerate(zip(split_sizes, offsets))
+                        }
+                    }
 
-                        for rank in range(self.world_size):
-                            all_param_shards[rank][name] = {
-                                'shard_data': shards[rank].clone(),
-                                'original_shape': param.shape,
-                                'is_trainable': is_trainable,
-                                'is_sharded': True
-                            }
-            # 为每个客户端准备其专属的分片包
-            all_client_packages_content = [{'shards': all_param_shards[rank]} for rank in range(self.world_size)]
-
-        # --- 5. 最终打包：将通用信息与特定内容合并 ---
-        all_client_packages = []
-        for rank in range(self.world_size):
-            client_package = all_client_packages_content[rank]
-            client_package['ref_counts'] = ref_counts_package
-            if noniid:
-                client_package.update(grouping_metadata)
-            all_client_packages.append(client_package)
+        # --- 3. 为所有客户端构建一个【统一的、轻量级的】元数据包 ---
+        base_package_content = {
+            'ref_counts': ref_counts_package,
+            'sharding_metadata': sharding_metadata,
+            # full_model_state_dict 和 shards 字段被彻底移除
+        }
+        if noniid:
+            base_package_content.update(grouping_metadata)
+            
+        # --- 4. 为每个客户端创建包 (内容完全相同) ---
+        all_client_packages = [base_package_content.copy() for _ in range(self.world_size)]
         
-        logger.info("[Coordinator] All client packages created successfully.")
-
+        logger.info("[Coordinator] All lightweight metadata packages created successfully.")
         return all_client_packages
-    
+
     def _calculate_grouping_and_layer_assignments(self):
         """
         【新函数】计算客户端分组、层分配和跨组通信映射。
@@ -2385,12 +2304,32 @@ class FedSpeedCoordinatorEngine:
 
         # 应用激活检查点 (如果配置了)
         if self.cfg.federate.use_activation_checkpointing:
-            try:
-                # 动态导入，避免硬编码
-                from transformers.models.gpt2.modeling_gpt2 import GPT2Block
-                self._apply_checkpointing_for_profile(GPT2Block)
-            except ImportError:
-                logger.warning("Could not import GPT2Block. Activation checkpointing for profiling is disabled.")
+            # 1. 从配置中动态获取块类名的字符串
+            block_class_name = self.cfg.federate.get('transformer_block_class_name')
+            if not block_class_name:
+                logger.warning(
+                    "`use_activation_checkpointing` is True, but `transformer_block_class_name` is not specified. "
+                    "Profiling will proceed without checkpointing, which may lead to inaccurate reference counts."
+                )
+            else:
+                # 2. 在模型中找到这个类对象
+                block_class = None
+                # CoordinatorEngine 的 self.model 是原始模型，可以直接搜索
+                for module in self.model.modules():
+                    if module.__class__.__name__ == block_class_name:
+                        block_class = module.__class__
+                        break
+                
+                if block_class:
+                    # 3. 使用找到的类对象来应用检查点
+                    logger.info(f"[Coordinator] Applying activation checkpointing for profiling to block class: {block_class.__name__}")
+                    self._apply_checkpointing_for_profile(block_class)
+                else:
+                    available_classes = {m.__class__.__name__ for m in self.model.modules()}
+                    logger.warning(
+                        f"Could not find the specified block class '{block_class_name}' in the model for profiling. "
+                        f"Proceeding without checkpointing. Available module classes include: {list(available_classes)[:10]}..."
+                    )
 
         # 注册演练钩子
         fwd_counter, recompute_counter, bwd_counter = {}, {}, {}
@@ -2450,11 +2389,8 @@ def natural_sort_key(s):
             for text in re.split('([0-9]+)', s)]
 
 def _sanitize_model_name_for_path(model_name: str) -> str:
-    """
-    一个辅助函数，用于将模型名称字符串转换为适合用作文件路径的格式。
-    例如: 'gpt2@huggingface_llm' -> 'gpt2_huggingface_llm'
-    """
-    return re.sub(r'[^a-zA-Z0-9_\-.]', '_', model_name)
+    base_name = os.path.basename(model_name)
+    return re.sub(r'[^a-zA-Z0-9_\-.]', '_', base_name)
 
 def log_memory_usage(stage_name):
     """打印当前 rank 的 GPU 内存使用情况。"""

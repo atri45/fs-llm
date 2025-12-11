@@ -1,0 +1,87 @@
+use_gpu: True
+device: 0
+early_stop:
+  patience: 3
+federate:
+  method: fedspeed
+  aggregation_mode: 'shardedGradient'
+  aggregation_steps: 10
+  asynchronous_aggregation: True
+  anonymous_routing: True
+  use_activation_checkpointing: True
+  mode: distributed
+  client_num: 7
+  save_to: "./saved_models/ptuning_dolly_ablationC41.ckpt"
+  model_cache_path: './model_cache/'
+  use_offline_model: True
+  gpu_mem_pressure_threshold: 0.9
+  gpu_mem_pressure_threshold: 0.9
+  prefetch_depth: 12
+  transformer_block_class_name: 'Qwen2DecoderLayer'
+  two_stages: 
+    use: True
+    stage_one_steps: 1000
+    noniid: False
+    group_num: 2
+  adaptive_weight:
+    use: True
+    type: 'exponential'
+    decay_rate: 0.98
+  gossip_num: -1
+data:
+  root: data/
+  type: 'dolly-15k@llm'
+  splits: [0.9,0.1,0]
+  splitter: 'iid'
+  splitter_args: [ 
+    {
+      num_groups: 2,
+      base_splitter_type: 'lda',
+      alpha: 0.1
+    }
+  ]
+distribute:
+  use: True
+  server_host: '10.214.151.191'
+  server_port: 50051
+  client_host: '10.214.151.191'
+  client_port: 50052
+  role: 'client'
+  data_idx: 1
+  grpc_max_send_message_length: 1048576000
+  grpc_max_receive_message_length: 1048576000
+llm:
+  tok_len: 1000
+  chat:
+    max_len: 1000
+  adapter:
+    use: True
+    args: [ { 'adapter_package': 'peft', 'adapter_method': 'p-tuning'} ]
+  deepspeed:
+    use: False
+    ds_config: 'federatedscope/llm/baseline/deepspeed/ds_config.json'
+  offsite_tuning:
+    use: False
+    emu_l: 2
+    emu_r: 30
+dataloader:
+  batch_size: 1
+model:
+  type: '/home/zzh/.cache/huggingface/hub/DeepSeek-R1-Distill-Qwen-1.5B@huggingface_llm'
+train:
+  local_update_steps: 10000
+  batch_or_epoch: batch
+  optimizer:
+    type: AdamW
+    lr: 0.0003
+    weight_decay: 0.0
+    betas: [0.9, 0.999]
+    eps: 1e-8
+criterion:
+  type: CrossEntropyLoss
+trainer:
+  type: fedspeedtrainer
+eval:
+  freq: 100
+  metrics: ['loss']
+  count_flops: False

@@ -60,23 +60,28 @@ class CommunicationMonitor:
         except (pickle.PicklingError, TypeError) as e:
             logger.warning(f"Could not estimate size of message content (type: {type(message_obj.content)}). Skipping. Error: {e}")
 
-    def record_dist_communication(self, op_name: str, tensor: torch.Tensor, world_size: int):
+    def record_dist_communication(self, op_name: str, tensor: torch.Tensor, world_size: int, src_rank: int = -1, my_rank: int = -1):
         """
         记录一次 torch.distributed 操作产生的通信量。
         """
-        # --- START OF MODIFICATION ---
-        if not self.is_monitoring: # <-- 新增：只有在监控状态下才记录
+        if not self.is_monitoring or not isinstance(tensor, torch.Tensor):
             return
-        # --- END OF MODIFICATION ---
-        
-        if not isinstance(tensor, torch.Tensor):
-            return
-
+            
         tensor_bytes = tensor.numel() * tensor.element_size()
         
         if op_name in ['all_gather', 'all_reduce', 'reduce_scatter']:
+            # 对称操作：每个节点都向其他 N-1 个节点发送数据。
+            # 我们只计算本节点的发送量。
             communication_bytes = tensor_bytes * (world_size - 1)
             self._total_bytes_sent += communication_bytes
+            logger.debug(f"[CommMonitor] Recorded {communication_bytes / 1024**2:.4f} MB for dist.{op_name}")
+            
+        elif op_name == 'broadcast':
+            # 非对称操作：只有源节点(src_rank)会发送。
+            if my_rank == src_rank:
+                communication_bytes = tensor_bytes * (world_size - 1)
+                self._total_bytes_sent += communication_bytes
+                logger.debug(f"[CommMonitor] Recorded {communication_bytes / 1024**2:.4f} MB for dist.{op_name} (as sender)")
 
     @property
     def total_gb_sent(self):
@@ -322,12 +327,11 @@ class FedSpeedClient(Client):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.my_rank = None
+        self.world_size = None
         self.dist_group_initialized = False
         self.asynchronous = self._cfg.federate.get('asynchronous_aggregation', False)
         self.anonymous_routing = self._cfg.federate.get('anonymous_routing', False)
         self.is_decentralized_sharded_mode = self._cfg.federate.aggregation_mode == 'shardedGradient'
-        if self.is_decentralized_sharded_mode:
-            self.anonymous_routing = True
         if self._cfg.federate.aggregation_mode == 'fl-sim':
             self.asynchronous = False
 
@@ -349,6 +353,7 @@ class FedSpeedClient(Client):
             if self.is_decentralized_sharded_mode:
                 self.register_handlers('anonymous_forward', self.trainer.passive_receive_message)
                 self.register_handlers('parameter_shard_update', self.trainer.passive_receive_message)
+                self.register_handlers('async_model_para', self.trainer.passive_receive_message)
             else:
                 # 其他异步模式（如 'model', 'local-reconstruct' 等）的消息处理器
                 self.register_handlers('async_model_para', self.trainer.passive_receive_message)
@@ -368,6 +373,49 @@ class FedSpeedClient(Client):
         # 调用原始的 send 方法完成实际的发送
         return self._original_send(message)
 
+    def _wrap_dist_functions(self):
+        """
+        包裹 torch.distributed 的关键函数以监控通信。
+        """
+        if getattr(dist, '_is_wrapped_by_monitor', False):
+            logger.debug("dist functions already wrapped. Skipping.")
+            return
+
+        logger.info(f"Client #{self.ID}: Wrapping torch.distributed functions for communication monitoring.")
+        
+        world_size = self.world_size
+        my_rank = self.my_rank
+
+        original_dist_broadcast = dist.broadcast
+        original_dist_all_gather = dist.all_gather
+        original_dist_all_gather_into_tensor = dist.all_gather_into_tensor
+        original_dist_all_reduce = dist.all_reduce
+        
+        def monitored_broadcast(tensor, src, group=None, async_op=False):
+            self.comm_monitor.record_dist_communication('broadcast', tensor, world_size, src_rank=src, my_rank=my_rank)
+            return original_dist_broadcast(tensor, src, group=group, async_op=async_op)
+
+        def monitored_all_gather(tensor_list, tensor, group=None, async_op=False):
+            self.comm_monitor.record_dist_communication('all_gather', tensor, world_size)
+            return original_dist_all_gather(tensor_list, tensor, group=group, async_op=async_op)
+        
+        def monitored_all_gather_into_tensor(output_tensor, input_tensor, group=None, async_op=False):
+            self.comm_monitor.record_dist_communication('all_gather', input_tensor, world_size)
+            return original_dist_all_gather_into_tensor(output_tensor, input_tensor, group=group, async_op=async_op)
+
+        def monitored_all_reduce(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False):
+            self.comm_monitor.record_dist_communication('all_reduce', tensor, world_size)
+            return original_dist_all_reduce(tensor, op=op, group=group, async_op=async_op)
+
+        # 应用猴子补丁
+        dist.broadcast = monitored_broadcast
+        dist.all_gather = monitored_all_gather
+        dist.all_gather_into_tensor = monitored_all_gather_into_tensor
+        dist.all_reduce = monitored_all_reduce
+        
+        # 设置一个标志，防止重复包裹
+        setattr(dist, '_is_wrapped_by_monitor', True)
+
     def callback_funcs_for_fedspeed_setup(self, message: Message):
         if dist.is_initialized():
             logger.warning(f"Client #{self.ID}: Default process group already initialized. Destroying it before creating new FedSpeed group.")
@@ -380,6 +428,7 @@ class FedSpeedClient(Client):
 
         config = message.content
         self.my_rank = config['rank']
+        self.world_size = config['world_size']
 
         if 'client_id' in config:
             self.ID = config['client_id']
@@ -388,15 +437,18 @@ class FedSpeedClient(Client):
 
         # ... (完整的 init_process_group 逻辑) ...
         try:
+            os.environ['GLOO_SOCKET_IFNAME'] = 'em2'
+            os.environ['TP_SOCKET_IFNAME'] = 'em2'
             os.environ['MASTER_ADDR'] = config['master_addr']
             os.environ['MASTER_PORT'] = str(config['master_port'])
             
             dist.init_process_group(
                 backend='gloo',
-                rank=config['rank'],
-                world_size=config['world_size']
+                rank=self.my_rank,
+                world_size=self.world_size
             )
             self.dist_group_initialized = True
+            self._wrap_dist_functions()
             logger.info(f"Client #{self.ID} (Rank {config['rank']}) successfully joined group.")
 
             # 如果需要匿名路由，则立即初始化 Router 并发送公钥
@@ -503,12 +555,23 @@ class FedSpeedClient(Client):
         except EarlyStopException:
             logger.info(f"Client #{self.ID}: Early stopping signal received.")
 
+        except Exception as e:
+            # 捕获所有其他非预期的异常
+            logger.error(f"An unexpected error occurred during client training!")
+            # 使用 exc_info=True 来记录完整的 Traceback 信息，这对于调试至关重要
+            logger.error(f"Error Type: {type(e).__name__}, Message: {e}", exc_info=True)
+
         finally:
             # 4. 无论训练是否成功，都尝试上传最终结果
             # 这确保了即使训练中途出错，也能保存当时的模型状态
             self.comm_monitor.stop()
-            self.trainer.monitor.stop()
             logger.info("Training finished or interrupted.")
+            self.trainer.monitor.stop()
+            self.trainer.communication_timer.report()
+            self.trainer.forward_timer.report()
+            self.trainer.backward_timer.report()
+            self.trainer.aggregation_timer.report()
+            self.trainer.update_timer.report()
             self.comm_monitor.report() 
             self.save_final_model_locally()
             # 发送训练结束信号给服务器
@@ -530,13 +593,13 @@ class FedSpeedClient(Client):
         """
         将最终的最佳模型以 FederatedScope 兼容的、完整的 state_dict 格式保存到本地磁盘。
         """
-        if self.my_rank != 0:
-            logger.info(f"Client #{self.ID} (Rank {self.my_rank}): Not Rank 0, skipping final model save.")
-            # 即使不保存，也应该清理临时文件
-            best_model_checkpoint_path = self.trainer.early_stopper.checkpoint_path
-            if os.path.exists(best_model_checkpoint_path):
-                os.remove(best_model_checkpoint_path)
-            return
+        # if self.my_rank != 0:
+        #     logger.info(f"Client #{self.ID} (Rank {self.my_rank}): Not Rank 0, skipping final model save.")
+        #     # 即使不保存，也应该清理临时文件
+        #     best_model_checkpoint_path = self.trainer.early_stopper.checkpoint_path
+        #     if os.path.exists(best_model_checkpoint_path):
+        #         os.remove(best_model_checkpoint_path)
+        #     return
         
         if not (hasattr(self.trainer, 'fedspeed_engine') and self.trainer.fedspeed_engine):
             logger.error("FedSpeedEngine not found. Cannot save model.")

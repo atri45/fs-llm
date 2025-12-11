@@ -11,13 +11,13 @@ federate:
   use_activation_checkpointing: True
   mode: distributed
   client_num: 4
-  save_to: "./saved_models/gpt2_alpaca.ckpt"
+  save_to: "./saved_models/Qwen1.5B_gsm8k.ckpt"
   model_cache_path: './model_cache/'
   use_offline_model: True
-  gpu_mem_pressure_threshold: 0.8
-  cpu_mem_pressure_threshold: 0.8
+  gpu_mem_pressure_threshold: 0.9
+  gpu_mem_pressure_threshold: 0.9
   prefetch_depth: 12
-  transformer_block_class_name: 'GPT2Block'
+  transformer_block_class_name: 'Qwen2DecoderLayer'
   two_stages: 
     use: False
     stage_one_steps: 600
@@ -26,7 +26,7 @@ federate:
   adaptive_weight:
     use: True
     type: 'exponential'
-    decay_rate: 0.95
+    decay_rate: 0.98
   gossip_num: -1
 data:
   root: data/
@@ -56,7 +56,7 @@ llm:
     max_len: 1000
   adapter:
     use: True
-    args: [ { 'adapter_package': 'peft', 'adapter_method': 'lora', 'r': 8, 'lora_alpha': 32, 'lora_dropout': 0.1 } ]
+    args: [ { 'adapter_package': 'peft', 'adapter_method': 'lora', 'r': 8, 'lora_alpha': 32, 'lora_dropout': 0.1 , 'target_modules': ['down_proj', 'gate_proj', 'k_proj', 'o_proj', 'q_proj', 'up_proj', 'v_proj']} ]
   deepspeed:
     use: False
     ds_config: 'federatedscope/llm/baseline/deepspeed/ds_config.json'
@@ -65,11 +65,11 @@ llm:
     emu_l: 2
     emu_r: 30
 dataloader:
-  batch_size: 2
+  batch_size: 1
 model:
-  type: 'gpt2@huggingface_llm'
+  type: '/home/zzh/.cache/huggingface/hub/DeepSeek-R1-Distill-Qwen-1.5B@huggingface_llm'
 train:
-  local_update_steps: 5000
+  local_update_steps: 100
   batch_or_epoch: batch  
   optimizer:
     type: AdamW

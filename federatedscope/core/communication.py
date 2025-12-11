@@ -122,10 +122,8 @@ class gRPCCommManager(object):
         else:
             self.comp_method = grpc.Compression.NoCompression
 
-        if cfg.federate.anonymous_routing:
-            self.server_funcs = anonymous_gRPCComServeFunc()
-        else:
-            self.server_funcs = gRPCComServeFunc()
+        self.server_funcs = anonymous_gRPCComServeFunc()
+
         self.grpc_server = self.serve(max_workers=client_num,
                                       host=host,
                                       port=port,

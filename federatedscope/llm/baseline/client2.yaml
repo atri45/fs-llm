@@ -1,0 +1,58 @@
+use_gpu: True
+early_stop:
+  patience: 3
+federate:
+  mode: distributed
+  client_num: 2
+  total_round_num: 30
+  save_to: "ptuning2.ckpt"
+data:
+  root: data/
+  type: 'rosetta_alpaca@llm'
+  splits: [0.9,0.1,0]
+  splitter: 'iid'
+distribute:
+  use: True
+  server_host: '10.214.151.190'
+  server_port: 50051
+  client_host: '10.214.151.190'
+  client_port: 50053
+  role: 'client'
+  data_idx: 2
+  grpc_max_send_message_length: 1048576000
+  grpc_max_receive_message_length: 1048576000
+llm:
+  tok_len: 1000
+  chat:
+    max_len: 1000
+  adapter:
+    use: True
+    args: [ { 'adapter_package': 'peft', 'adapter_method': 'p-tuning'} ]
+  deepspeed:
+    use: False
+    ds_config: 'federatedscope/llm/baseline/deepspeed/ds_config.json'
+  offsite_tuning:
+    use: False
+    emu_l: 2
+    emu_r: 30
+dataloader:
+  batch_size: 1
+model:
+  type: '/home/zzh/.cache/huggingface/hub/DeepSeek-R1-Distill-Qwen-1.5B@huggingface_llm'
+train:
+  local_update_steps: 10
+  batch_or_epoch: batch
+  optimizer:
+    type: AdamW
+    lr: 0.0003
+    weight_decay: 0.0
+    betas: [0.9, 0.999]
+    eps: 1e-8
+criterion:
+  type: CrossEntropyLoss
+trainer:
+  type: llmtrainer
+eval:
+  freq: 10
+  metrics: ['loss']
+  count_flops: False

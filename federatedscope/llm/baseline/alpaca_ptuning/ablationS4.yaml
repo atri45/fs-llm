@@ -1,0 +1,74 @@
+use_gpu: True
+early_stop:
+  patience: 3
+federate:
+  method: fedspeed
+  aggregation_mode: 'shardedGradient'
+  aggregation_steps: 10
+  asynchronous_aggregation: True
+  anonymous_routing: True
+  use_activation_checkpointing: True
+  use_offline_model: True
+  two_stages: 
+    use: True
+    stage_one_steps: 1000
+    noniid: False
+    group_num: 2
+  mode: distributed
+  client_num: 2
+  save_to: "./saved_models/ablation4.ckpt"
+data:
+  root: data/
+  type: 'rosetta_alpaca@llm'
+  splits: [0.9,0.1,0]
+  splitter: 'iid'
+  splitter_args: [ 
+    {
+      num_groups: 2,
+      base_splitter_type: 'lda',
+      alpha: 0.1
+    }
+  ]
+distribute:
+  use: True
+  server_host: '10.214.151.195'
+  server_port: 50051
+  role: 'server'
+  data_idx: -1
+  grpc_max_send_message_length: 1048576000
+  grpc_max_receive_message_length: 1048576000
+llm:
+  tok_len: 1000
+  chat:
+    max_len: 1000
+  adapter:
+    use: True
+    args: [ { 'adapter_package': 'peft', 'adapter_method': 'ia3', 'target_modules': ['down_proj', 'gate_proj', 'k_proj', 'o_proj', 'q_proj', 'up_proj', 'v_proj'], 'feedforward_modules': ['down_proj', 'gate_proj', 'k_proj', 'o_proj', 'q_proj', 'up_proj', 'v_proj']} ]
+  deepspeed:
+    use: False
+    ds_config: 'federatedscope/llm/baseline/deepspeed/ds_config.json'
+  offsite_tuning:
+    use: False
+    emu_l: 2
+    emu_r: 30
+dataloader:
+  batch_size: 1
+model:
+  type: '/home/zzh/.cache/huggingface/hub/DeepSeek-R1-Distill-Qwen-1.5B@huggingface_llm'
+train:
+  local_update_steps: 10000
+  batch_or_epoch: batch
+  optimizer:
+    type: AdamW
+    lr: 0.0003
+    weight_decay: 0.0
+    betas: [0.9, 0.999]
+    eps: 1e-8
+criterion:
+  type: CrossEntropyLoss
+trainer:
+  type: fedspeedtrainer
+eval:
+  freq: 100
+  metrics: ['loss']
+  count_flops: False

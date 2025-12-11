@@ -1,6 +1,8 @@
 import os
 import sys
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 DEV_MODE = False  # simplify the federatedscope re-setup everytime we change
 # the source codes of federatedscope
 if DEV_MODE:

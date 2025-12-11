@@ -4,7 +4,7 @@ early_stop:
   patience: 0
 federate:
   mode: distributed
-  client_num: 4
+  client_num: 2
   total_round_num: 250
   save_to: "gpt2_new.ckpt"
 data:
@@ -39,7 +39,7 @@ llm:
 dataloader:
   batch_size: 2
 model:
-  type: 'gpt2@huggingface_llm'
+  type: '/home/zzh/.cache/huggingface/hub/DeepSeek-R1-Distill-Qwen-1.5B@huggingface_llm'
 train:
   local_update_steps: 25
   batch_or_epoch: batch

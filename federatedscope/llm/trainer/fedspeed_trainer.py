@@ -12,7 +12,6 @@ import numpy as np
 
 from federatedscope.core.monitors.monitor import Monitor
 from federatedscope.core.trainers.context import CtxVar
-from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 from torch.utils.checkpoint import checkpoint
 from federatedscope.llm.trainer.trainer import LLMTrainer
 from federatedscope.llm.trainer.fedspeed_engine import FedSpeedEngine, log_memory_usage
@@ -103,7 +102,12 @@ class PerformanceMonitor:
         self.device = device
         self.start_time = 0.0
         self.end_time = 0.0
-        
+        self.self_training_seconds = 0.0
+        self.total_training_seconds = 0.0 # 用于累加纯训练时间
+        self._last_resume_time = 0.0
+        self._is_running = False
+        self._is_paused = False
+
         # 追踪 CPU 内存 (RAM)
         self.process = psutil.Process(os.getpid())
         self.cpu_mem_usage_peak = 0.0 # 单位: MB
@@ -126,17 +130,50 @@ class PerformanceMonitor:
 
     def start(self):
         """开始计时和监控。"""
+        if self._is_running:
+            return # 防止重复启动
         # 使用辅助函数进行判断
         if self._is_cuda():
             torch.cuda.reset_peak_memory_stats(self.device)
         
         self.start_time = time.time()
+        self._last_resume_time = self.start_time
+        self._is_running = True
+        self._is_paused = False
         logger.info("Performance monitor started.")
+        
+    def pause(self):
+        """暂停计时，将当前时间段累加到总时间中。"""
+        if self._is_running and not self._is_paused:
+            current_time = time.time()
+            self.total_training_seconds += (current_time - self._last_resume_time)
+            self._is_paused = True
+            logger.debug("Performance monitor paused.")
+
+    def resume(self):
+        """恢复计时。"""
+        if self._is_running and self._is_paused:
+            self._last_resume_time = time.time()
+            self._is_paused = False
+            logger.debug("Performance monitor resumed.")
+    
+    def self_stop(self):
+        """记录本地收敛所用训练时间。"""
+        if not self._is_running:
+            return
+
+        self.self_training_seconds = self.total_training_seconds
         
     def stop(self):
         """停止计时，收集峰值数据，并打印报告。"""
+        if not self._is_running:
+            return
+
         self.end_time = time.time()
         
+        if not self._is_paused:
+            self.total_training_seconds += (self.end_time - self._last_resume_time)
+
         # 收集峰值数据
         self.cpu_mem_usage_peak = self.process.memory_info().rss / (1024 ** 2)
         
@@ -146,45 +183,51 @@ class PerformanceMonitor:
             self.gpu_mem_reserved_peak = stats["reserved_bytes.all.peak"] / (1024 ** 2)
 
         self.report()
+        self._is_running = False
 
     def report(self):
         """打印性能报告。"""
-        total_seconds = self.end_time - self.start_time
-        total_minutes = total_seconds / 60.0
+        total_wall_clock_seconds = self.end_time - self.start_time
+        total_wall_clock_hours = total_wall_clock_seconds / 3600.0
+        
+        # 纯训练时间
+        self_training_hours = self.self_training_seconds / 3600.0
+        total_training_hours = self.total_training_seconds / 3600.0
 
         logger.info("----------- Performance Report -----------")
-        logger.info(f"  - Total Training Time: {total_minutes:.2f} minutes ({total_seconds:.2f} seconds)")
-        logger.info(f"  - CPU Memory Peak Usage (RSS): {self.cpu_mem_usage_peak:.2f} MB")
+        logger.info(f"  - Total Wall-Clock Time: {total_wall_clock_hours:.2f} hours ({total_wall_clock_seconds:.2f} seconds)")
+        logger.info(f"  - Pure Self Training Time (excluding evaluation): {self_training_hours:.2f} hours ({self.self_training_seconds:.2f} seconds)")
+        logger.info(f"  - Pure Total Training Time (excluding evaluation): {total_training_hours:.2f} hours ({self.total_training_seconds:.2f} seconds)")
+        
+        logger.info(f"  - CPU Memory Peak Usage (RSS): {self.cpu_mem_usage_peak / 1024.0:.2f} GB ({self.cpu_mem_usage_peak} MB)")
         
         if self._is_cuda():
-            logger.info(f"  - GPU Memory Peak Allocated: {self.gpu_mem_allocated_peak:.2f} MB")
-            logger.info(f"  - GPU Memory Peak Reserved: {self.gpu_mem_reserved_peak:.2f} MB")
+            logger.info(f"  - GPU Memory Peak Allocated: {self.gpu_mem_allocated_peak / 1024.0:.2f} GB ({self.gpu_mem_allocated_peak} MB)")
+            logger.info(f"  - GPU Memory Peak Reserved: {self.gpu_mem_reserved_peak / 1024.0:.2f} GB ({self.gpu_mem_reserved_peak} MB)")
         else:
             logger.info("  - GPU Monitoring: Not available (CUDA not found or not used).")
         logger.info("------------------------------------------")
 
 
-class AggregationTimer:
+class StepTimer:
     """
-    一个用于精确测量并累加总聚合时间的类。
-    支持手动 start/stop 和作为上下文管理器使用。
+    一个通用的上下文管理器，用于测量代码块的执行时间并进行累加。
     """
-    def __init__(self):
-        self._total_aggregation_time = 0.0
+    def __init__(self, name: str):
+        self.name = name
+        self._total_seconds = 0.0
         self._start_time = 0.0
-        self._is_running = False # 新增：标记计时器是否正在运行
+        self._is_running = False
 
     def start(self):
-        """手动开始计时。"""
         if not self._is_running:
             self._start_time = time.perf_counter()
             self._is_running = True
 
     def stop(self):
-        """手动停止计时并累加时间。"""
         if self._is_running:
             end_time = time.perf_counter()
-            self._total_aggregation_time += (end_time - self._start_time)
+            self._total_seconds += (end_time - self._start_time)
             self._is_running = False
 
     def __enter__(self):
@@ -194,19 +237,33 @@ class AggregationTimer:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.stop()
 
-    def reset(self):
-        self._total_aggregation_time = 0.0
-        self._is_running = False
-
     @property
-    def total_seconds(self):
-        return self._total_aggregation_time
+    def total_time(self):
+        return self._total_seconds
 
     def report(self):
-        """打印最终的聚合时间报告。"""
-        logger.info(f"----------- Aggregation Time Report -----------")
-        logger.info(f"  - Total Time Spent in Aggregation: {self.total_seconds:.4f} seconds")
-        logger.info("---------------------------------------------------------")
+        logger.info(f"  - Total Time in {self.name}: {self.total_time:.4f} seconds")
+
+# --- 现在定义具体的计时器 ---
+class CommunicationTimer(StepTimer):
+    def __init__(self):
+        super().__init__("Communication")
+
+class ForwardTimer(StepTimer):
+    def __init__(self):
+        super().__init__("Forward")
+
+class BackwardTimer(StepTimer):
+    def __init__(self):
+        super().__init__("Backward")
+
+class UpdateTimer(StepTimer):
+    def __init__(self):
+        super().__init__("Update")
+
+class AggregationTimer(StepTimer):
+    def __init__(self):
+        super().__init__("Aggregation")
 
 
 class FedSpeedTrainer(LLMTrainer):
@@ -224,6 +281,11 @@ class FedSpeedTrainer(LLMTrainer):
         self.internal_message_queue = queue.Queue()
         self.comm_executor = None
         self.monitor = PerformanceMonitor(device)
+        # 初始化所有计时器
+        self.communication_timer = CommunicationTimer()
+        self.forward_timer = ForwardTimer()
+        self.backward_timer = BackwardTimer()
+        self.update_timer = UpdateTimer()
         self.aggregation_timer = AggregationTimer()
 
         self.aggregation_mode = self.config.federate.get('aggregation_mode') 
@@ -235,8 +297,6 @@ class FedSpeedTrainer(LLMTrainer):
         self.gossip_num = self._cfg.federate.get('gossip_num', 1)
         self.eval_freq = self._cfg.eval.get('freq')
         self.anonymous_routing = self.cfg.federate.get('anonymous_routing', False)
-        if self.is_decentralized_sharded_mode:
-            self.anonymous_routing = True
         if self.aggregation_mode in ['fl-sim'] :
             self.asynchronous = False
 
@@ -298,6 +358,28 @@ class FedSpeedTrainer(LLMTrainer):
 
     def _hook_on_fit_start_init(self, ctx):
         super()._hook_on_fit_start_init(ctx)
+        # a. 获取总的目标 step 数
+        total_steps = self.cfg.train.local_update_steps
+        
+        # b. 将 epoch 数强制设为 1
+        ctx.num_train_epoch = 1
+        
+        # c. 将一个 "epoch" 内的 batch 数，直接设置为总的 step 数
+        ctx.num_train_batch = total_steps
+        ctx.num_train_batch_last_epoch = total_steps # 也更新这个
+
+        logger.info(
+            f"Step-based training is enabled. Overriding training loop length: "
+            f"num_train_epoch=1, num_train_batch={total_steps}."
+        )
+        
+        # d. 确保 dataloader 被 ReIterator 包裹，以支持超过一轮的数据迭代
+        loader_key = "train_loader"
+        dataloader = ctx.get(loader_key)
+        if dataloader is not None and not isinstance(dataloader, ReIterator):
+            ctx[loader_key] = ReIterator(dataloader)
+            logger.info(f"Wrapped '{loader_key}' with ReIterator for step-based training.")
+            
         # 检查并创建FedSpeedEngine
         if self.fedspeed_engine is None and dist.is_initialized():
             if self.fedspeed_init_package is None:
@@ -305,8 +387,7 @@ class FedSpeedTrainer(LLMTrainer):
 
             init_package = self.fedspeed_init_package
             self.aggregation_mode = self.config.federate.get('aggregation_mode') 
-            if self.aggregation_mode in ['shardedGradient', 'local-reconstruct']:
-                self.fedspeed_engine = FedSpeedEngine(
+            self.fedspeed_engine = FedSpeedEngine(
                 ctx.model, 
                 self.cfg, 
                 ctx.device, 
@@ -314,19 +395,38 @@ class FedSpeedTrainer(LLMTrainer):
                 initial_shards=init_package,
                 ref_counts=init_package['ref_counts']
             )
-            else:
-                self.fedspeed_engine = FedSpeedEngine(
-                    ctx.model, 
-                    self.cfg, 
-                    ctx.device, 
-                    dist.group.WORLD,
-                    initial_shards=init_package['shards'],
-                    ref_counts=init_package['ref_counts']
-                )
-
-            # 激活检查点和钩子注册逻辑不变
+            # 激活检查点
             if self.cfg.federate.use_activation_checkpointing:
-                apply_checkpointing(ctx.model, GPT2Block, self.fedspeed_engine)
+            # 1. 从配置中动态获取块类名的字符串
+                block_class_name = self.cfg.federate.get('transformer_block_class_name')
+                if not block_class_name:
+                    raise ValueError(
+                        "`federate.use_activation_checkpointing` is True, but "
+                        "`federate.transformer_block_class_name` is not specified in the config."
+                    )
+
+                # 2. 在加载的模型中找到这个类对象
+                block_class = None
+                # 我们需要遍历内部的 PeftModel 或 base_model
+                model_to_search = ctx.model
+                if hasattr(model_to_search, 'model'): # AdapterModel -> PeftModel
+                    model_to_search = model_to_search.model
+                    
+                for module in model_to_search.modules():
+                    if module.__class__.__name__ == block_class_name:
+                        block_class = module.__class__
+                        break
+                
+                if block_class is None:
+                    available_classes = {m.__class__.__name__ for m in model_to_search.modules()}
+                    raise ValueError(
+                        f"Could not find the specified block class '{block_class_name}' in the model for activation checkpointing. "
+                        f"Available module classes include (first 10): {list(available_classes)[:10]}..."
+                    )
+                
+                # 3. 使用找到的类对象来应用检查点
+                logger.info(f"Applying activation checkpointing to block class: {block_class.__name__}")
+                apply_checkpointing(ctx.model, block_class, self.fedspeed_engine)
 
             self.fedspeed_engine._register_hooks_recursively(self.fedspeed_engine.model)
             
@@ -345,14 +445,27 @@ class FedSpeedTrainer(LLMTrainer):
             self.fedspeed_engine.aggregation_timer = self.aggregation_timer
             self.monitor.start()
 
+            if self.fedspeed_engine.is_hybrid_mode:
+                self.is_decentralized_sharded_mode = False
+                self.aggregation_mode = 'local-reconstruct'
+
     # 将所有复杂逻辑都委托给 Engine
     def _hook_on_batch_forward(self, ctx):
         logger.debug(f"batch_forward")
         # 调用引擎的forward方法
         #    所有的All-Gather和释放都会在内部被钩子自动处理
         data_batch_on_device = {k: v.to(ctx.device) for k, v in ctx.data_batch.items()}
+                # 检查 attention_mask 的类型，并进行转换以兼容 adapters 库
+        if 'attention_mask' in data_batch_on_device and data_batch_on_device['attention_mask'].dtype == torch.bool:
+            
+            # 'adapters' 库的内部实现需要数值类型的 attention_mask
+            # 我们将其转换为 long 类型 (0 和 1)
+            logger.debug("Converting boolean attention_mask to long for adapter compatibility.")
+            data_batch_on_device['attention_mask'] = data_batch_on_device['attention_mask'].long()
         log_memory_usage("Forward Start")
+        self.forward_timer.start()
         outputs = self.fedspeed_engine.forward(**data_batch_on_device)
+        self.forward_timer.stop()
         log_memory_usage("Forward End")
         
         # 将结果保存到 ctx 中
@@ -392,7 +505,9 @@ class FedSpeedTrainer(LLMTrainer):
         if hasattr(ctx, 'loss_task') and ctx.loss_task.requires_grad:
             # 这一步只负责调用 engine.backward()，它会完成流式的参数管理和梯度收集
             log_memory_usage("Backward Start")
+            self.backward_timer.start()
             self.fedspeed_engine.backward(ctx.loss_task)
+            self.backward_timer.stop()
             log_memory_usage("Backward End (Grads Collected)")
 
     def _hook_on_batch_end(self, ctx):
@@ -404,15 +519,26 @@ class FedSpeedTrainer(LLMTrainer):
         self.current_step += 1
 
         # --- 检查是否需要阶段转换 ---
-        if self.fedspeed_engine.noniid and self.current_step == self.stage_one_steps:
-            self._trigger_stage_transition()
+        if self.fedspeed_engine.is_hybrid_mode and self.current_step == self.stage_one_steps:
+            self.is_decentralized_sharded_mode = True
+            self.aggregation_mode = 'shardedGradient'              
+            self.fedspeed_engine.aggregation_mode = 'shardedGradient'
+            self.fedspeed_engine.local_optimizer = None
+            self.fedspeed_engine._initialize_with_reconstructor()
+            self.fedspeed_engine._initialize_for_shardedGradient()
+        if self.current_step == self.stage_one_steps:
+            if self.fedspeed_engine.noniid:
+                self._trigger_stage_transition()
+            # else:
+            #     self.fedspeed_engine.sync_model_layers_via_broadcast()
+            #     logger.info("--- Layer-wise sync complete. Now entering Stage 2. ---")
 
         # 通用异步逻辑 (消息处理)
-        logger.debug(f"process_incoming_messages")
-        # if self.asynchronous:
-        self.aggregation_timer.start()
-        self.process_incoming_messages()   
-        self.aggregation_timer.stop() 
+        if self.fedspeed_engine.noniid or not self.fedspeed_engine.is_in_stage_one:
+            logger.debug(f"process_incoming_messages")
+            self.aggregation_timer.start()
+            self.process_incoming_messages()   
+            self.aggregation_timer.stop() 
 
         # 梯度分片处理流程
         if self.is_decentralized_sharded_mode:
@@ -425,23 +551,29 @@ class FedSpeedTrainer(LLMTrainer):
             if grouped_shards_to_dispatch:
                 logger.debug(f"send_gradient_shard_anonymously")
                 self.aggregation_timer.start()
+                self.communication_timer.start()
                 for target_client_id, shard_list in grouped_shards_to_dispatch.items():
                     if shard_list: # 确保列表不为空
                         self.send_gradient_shards_anonymously_packaged(
                             shard_list, # 发送整个列表
                             target_client_id
                         )
+                self.communication_timer.stop()
                 self.aggregation_timer.stop()
 
             # 3. 执行优化器步骤 (内部包含梯度 FedAvg 聚合)
             logger.debug(f"sharded_step")
+            self.update_timer.start()
             updated_shards_for_broadcast, model_was_updated_by_peers = self.fedspeed_engine.sharded_step(my_local_grad_shards)
+            self.update_timer.stop()
 
             # 4. 异步推送更新后的参数分片 (非匿名)
             if model_was_updated_by_peers and not self.fedspeed_engine.is_in_stage_one:
                 logger.debug(f"broadcast_shard_updates")
                 self.aggregation_timer.start()
+                self.communication_timer.start()
                 self.broadcast_shard_updates(updated_shards_for_broadcast)
+                self.communication_timer.stop()
                 self.aggregation_timer.stop()
 
         else:
@@ -469,13 +601,19 @@ class FedSpeedTrainer(LLMTrainer):
 
                 self.aggregation_timer.stop()
 
+        # 回收显存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         # 日志和评估
         my_rank = dist.get_rank()
         logger.info(f"--- Rank {my_rank} | Step {self.current_step} | Loss: {ctx.loss_batch.item():.4f} ---")
         ctx.num_samples += ctx.batch_size
         ctx.loss_batch_total += ctx.loss_batch.item() * ctx.batch_size
         if self.eval_freq > 0 and (self.current_step % self.eval_freq) == 0 and not self.fedspeed_engine.is_in_stage_one:
+            self.monitor.pause()
             self.evaluation()
+            self.monitor.resume()
 
         # 回收显存
         if torch.cuda.is_available():
@@ -487,7 +625,6 @@ class FedSpeedTrainer(LLMTrainer):
                 
     def _hook_on_fit_end(self, ctx):
         # --- 首先调用原有的 _hook_on_fit_end ---
-        self.aggregation_timer.report()
         super()._hook_on_fit_end(ctx)
         # 在所有训练结束后，安全地停止 Reconstructor 的后台线程
         if self.fedspeed_engine and self.fedspeed_engine.reconstructor:
@@ -608,9 +745,6 @@ class FedSpeedTrainer(LLMTrainer):
         """
         将一批发往同一个目标的梯度分片打包，并使用匿名路由一次性发送。
         """
-        if not self.router:
-            logger.error("Anonymous routing is enabled, but the router is not initialized.")
-            return
         # --- 1. 手动将 Tensor 序列化为 bytes ---
         # 我们对原始的 shard_list 进行就地修改
         for content_dict in shard_list:
@@ -622,23 +756,27 @@ class FedSpeedTrainer(LLMTrainer):
                 content_dict['grad_shard_data'] = {"b64_pickled_tensor": base64_string}
 
         original_content = shard_list
-        # 调用 Router 构建并加密路由
-        first_hop_id, final_message_content = self.router.build_anonymous_route(
-            original_content, 
-            target_client_id, 
-            self.fedspeed_engine.current_step
-        )
 
-        if first_hop_id is not None and self.comm_executor:
-            self.comm_executor.submit(
-                self._background_send_task,
-                'anonymous_forward',
-                [first_hop_id],
-                final_message_content
+        if self.anonymous_routing:
+            # 调用 Router 构建并加密路由
+            first_hop_id, final_message_content = self.router.build_anonymous_route(
+                original_content, 
+                target_client_id, 
+                self.fedspeed_engine.current_step
             )
-        elif first_hop_id is not None:
-            # 如果没有线程池，退化到同步发送
-            self._background_send_task('anonymous_forward', [first_hop_id], final_message_content)
+
+            if first_hop_id is not None and self.comm_executor:
+                self.comm_executor.submit(
+                    self._background_send_task,
+                    'anonymous_forward',
+                    [first_hop_id],
+                    final_message_content
+                )
+            elif first_hop_id is not None:
+                # 如果没有线程池，退化到同步发送
+                self._background_send_task('anonymous_forward', [first_hop_id], final_message_content)
+        else:
+            self._background_send_task('anonymous_forward', [target_client_id], original_content)
             
     def broadcast_shard_updates(self, updated_shards: list):
         """
@@ -802,18 +940,22 @@ class FedSpeedTrainer(LLMTrainer):
         """
         处理【加密】的匿名消息。
         """
-        if not self.router: return
-        
-        # 调用 Router 处理
-        result = self.router.handle_anonymous_message(message)
-        if result is None: return
+        if self.anonymous_routing:
+            # 调用 Router 处理
+            result = self.router.handle_anonymous_message(message)
+            if result is None: return
+            action, data = result
+        else:
+            action = 'aggregate'
 
-        action, data = result
         if action == 'aggregate':
             logger.debug("recieve aggregate message")
             # 梯度分片
             if self.is_decentralized_sharded_mode:
-                decrypted_content = data['content']
+                if self.anonymous_routing:
+                    decrypted_content = data['content']
+                else:
+                    decrypted_content = message.content
                 # 遍历并处理
                 for item in decrypted_content:
                     # 将 bytes 转为 tensor
@@ -954,6 +1096,13 @@ class FedSpeedTrainer(LLMTrainer):
                         ctx.data_batch = batch_data
                         
                         data_batch_on_device = {k: v.to(ctx.device) for k, v in ctx.data_batch.items()}
+                        # 复制与 _hook_on_batch_forward 中相同的修复逻辑
+                        # 检查 attention_mask 的类型，并进行转换以兼容 adapters 库
+                        if 'attention_mask' in data_batch_on_device and \
+                        data_batch_on_device['attention_mask'].dtype == torch.bool:
+                            
+                            logger.debug("[Evaluation] Converting boolean attention_mask to long for adapter compatibility.")
+                            data_batch_on_device['attention_mask'] = data_batch_on_device['attention_mask'].long()
                         outputs = self.fedspeed_engine.forward(**data_batch_on_device)
                         
                         if hasattr(outputs, 'loss') and outputs.loss is not None:
@@ -1006,6 +1155,7 @@ class FedSpeedTrainer(LLMTrainer):
                 
                 self.early_stopper(score_to_check, self.fedspeed_engine)
                 if self.early_stopper.early_stop and not self.global_early_stop_votes[self.client_id]:
+                    self.monitor.self_stop()
                     # 广播早停投票
                     logger.info(f"--- [Client {self.client_id}] local early stop condition TRIGGERED! Broadcast vote. ---")
                     self.broadcast_early_stop_vote()
@@ -1029,8 +1179,7 @@ class FedSpeedTrainer(LLMTrainer):
 
 def apply_checkpointing(model, block_class, engine):
     """
-    遍历模型，用一个包装了 checkpoint 的新 forward 方法
-    来替换掉原始的 forward 方法。使用默认参数来正确捕获闭包变量。
+    遍历模型，用一个包装了 checkpoint 的新 forward 方法来替换掉原始的 forward 方法。
     """
     logger.info(f"Applying activation checkpointing to all modules of type {block_class.__name__}")
     

@@ -1,7 +1,20 @@
+import os
 import torch
 import torch.nn as nn
 from collections import OrderedDict
+import logging
 
+try:
+    from peft import PeftModel, get_peft_model_state_dict
+except ImportError:
+    class PeftModel: pass
+    get_peft_model_state_dict = None
+try:
+    import adapters
+except ImportError:
+    adapters = None
+
+logger = logging.getLogger(__name__)
 
 def enable_adapter(model, package, adapter, **kwargs):
     """
@@ -50,8 +63,23 @@ def enable_adapter(model, package, adapter, **kwargs):
             model = get_peft_model(model, peft_config)
         elif adapter == 'p-tuning':
             from peft import PromptEncoderConfig
-            peft_config = PromptEncoderConfig(task_type=TaskType.CAUSAL_LM,
-                                              **kwargs)
+            peft_config = PromptEncoderConfig(
+                peft_type="P_TUNING",
+                task_type=TaskType.CAUSAL_LM,  # Qwen是Causal LM (仅解码器)
+                
+                # --- 核心超参数 (你可以调整) ---
+                num_virtual_tokens=32,          # 虚拟提示的长度。20-100是常用范围。32是一个好的起点。
+                
+                # --- 必须与Qwen-1.5B模型架构匹配的参数 ---
+                token_dim=1536,                 # 模型的隐藏层维度 (hidden_size)
+                num_transformer_submodules=1,   # 对于仅解码器模型，总是1
+                num_attention_heads=12,         # Qwen-1.5B的注意力头数 (请再次确认)
+                num_layers=28,                  # Qwen-1.5B的层数
+                
+                # --- Prompt Encoder 的内部结构配置 ---
+                encoder_reparameterization_type="MLP", # 使用MLP来生成提示嵌入，比LSTM更常用
+                encoder_hidden_size=1024        # Prompt Encoder内部MLP的隐藏层大小。通常是token_dim的一半左右。
+            )
             model = get_peft_model(model, peft_config)
         elif adapter == 'adalora':
             from peft import AdaLoraConfig
@@ -145,9 +173,9 @@ def enable_adapter(model, package, adapter, **kwargs):
             model.train_adapter(['bottleneck_adapter'])
 
         elif adapter == 'language':
-            from adapters import DoubleSeqBnInvConfig
+            from adapters import SeqBnInvConfig
 
-            config = DoubleSeqBnInvConfig()
+            config = SeqBnInvConfig()
             model.add_adapter("language_adapter", config=config)
             model.train_adapter(['language_adapter'])
 

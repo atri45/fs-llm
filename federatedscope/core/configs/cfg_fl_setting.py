@@ -44,7 +44,7 @@ def extend_fl_setting_cfg(cfg):
     cfg.federate.gpu_mem_pressure_threshold= 0.9
     cfg.federate.cpu_mem_pressure_threshold= 0.9
     cfg.federate.prefetch_depth= 2
-    cfg.federate.transformer_block_class_name= 'GPT2Block'
+    cfg.federate.transformer_block_class_name= 'Qwen2DecoderLayer'
     cfg.federate.two_stages= CN()
     cfg.federate.two_stages.use= False
     cfg.federate.two_stages.stage_one_steps= 100
